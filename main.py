@@ -3,23 +3,28 @@ import json
 import logging
 import os
 import re
+import unicodedata
 import hashlib
+import difflib
 import time
 import zipfile
 import io
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from html import escape as _esc
+from urllib.parse import quote
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardRemove, BufferedInputFile, BotCommand
+    Message, CallbackQuery, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardRemove, BufferedInputFile, BotCommand
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 
 
 # Tugma yozuvlari uchun foydalanuvchi tanlagan small-caps uslubi.
@@ -31,11 +36,58 @@ _SMALL_CAPS = str.maketrans({
 })
 def small_caps(value):
     return str(value).translate(_SMALL_CAPS)
+
+# Premium (custom) emoji ID larni Telegram faqat Fragment'da username sotib olgan
+# botlarda qabul qiladi. Bir marta aniqlangach holat butun jarayonga qo'llanadi.
+_CUSTOM_EMOJI_STATE = {"allowed": True}
+
+
+def _button_emoji_value(callback_data):
+    """Owner panelida tugmaga biriktirilgan premium emoji ID yoki oddiy emoji."""
+    try:
+        saved = load_data().get("settings", {}).get("button_emojis", {})
+        return str(saved.get(str(callback_data)) or "").strip()
+    except Exception:
+        return ""
+
+
+def _apply_button_emoji(button, value):
+    if not value or not _CUSTOM_EMOJI_STATE["allowed"]:
+        return button
+    if value.isdigit():
+        # icon_custom_emoji_id premium emojini tugma oldiga qo'yadi.
+        try:
+            button.icon_custom_emoji_id = value
+        except Exception:
+            pass
+        return button
+    if value not in button.text:
+        button.text = (value + " " + button.text).strip()
+    return button
+
+
+def _strip_custom_emoji_icons(markup):
+    """Telegram premium emojini rad etsa, tugmalardan ikonkani olib tashlaydi."""
+    try:
+        for row in markup.inline_keyboard:
+            for button in row:
+                if getattr(button, "icon_custom_emoji_id", None):
+                    button.icon_custom_emoji_id = None
+    except Exception:
+        pass
+    return markup
+
+
+def _is_custom_emoji_error(exc):
+    text = str(exc).lower()
+    return "emoji" in text or "button_icon" in text
+
+
 def InlineKeyboardButton(*, text, **kwargs):
     """Tugma sozlamalarini har tugmada diskdan o'qimasdan, xotiradagi ma'lumotdan oladi."""
+    _cb = str(kwargs.get("callback_data", ""))
     try:
         _cfg = load_data().get("settings", {})
-        _cb = str(kwargs.get("callback_data", ""))
         _custom_text = _cfg.get("button_texts", {}).get(_cb)
         if _custom_text:
             text = _custom_text
@@ -53,7 +105,8 @@ def InlineKeyboardButton(*, text, **kwargs):
             kwargs.pop("style", None)
     except Exception:
         pass
-    return TelegramInlineKeyboardButton(text=small_caps(text), **kwargs)
+    button = TelegramInlineKeyboardButton(text=small_caps(text), **kwargs)
+    return _apply_button_emoji(button, _button_emoji_value(_cb))
 
 def _button_color_group(callback_data, text=""):
     cb = str(callback_data or "")
@@ -68,9 +121,11 @@ def _button_color_group(callback_data, text=""):
         return "page_indicator"
     if cb in ("home", "admin_home") or "Orqaga" in text or "Asosiy menyu" in text:
         return "back"
+    if cb.startswith("episode:") and "Keyingi qism" in str(text):
+        return "next_episode"
     if cb.startswith(("episode:", "show:", "season_show:", "catalog_show:")) or cb in ("list", "movie_list", "continue_watching"):
         return "content"
-    if cb in ("search", "search_name", "search_menu") or "qidirish" in text.casefold():
+    if cb in ("search", "search_name", "search_menu") or cb.startswith(("search:", "search_name:", "sm:")) or "qidirish" in text.casefold():
         return "search"
     return "other"
 
@@ -146,21 +201,32 @@ def small_caps_html(value):
     return "".join(output)
 
 class StyledBot(Bot):
+    async def _call_with_emoji_fallback(self, method, *args, **kwargs):
+        try:
+            return await method(*args, **kwargs)
+        except TelegramBadRequest as exc:
+            if _CUSTOM_EMOJI_STATE["allowed"] and _is_custom_emoji_error(exc):
+                _CUSTOM_EMOJI_STATE["allowed"] = False
+                logging.warning("Premium emoji tugmalarda ishlamadi, emojisiz qayta yuborilmoqda: %s", exc)
+                _strip_custom_emoji_icons(kwargs.get("reply_markup"))
+                return await method(*args, **kwargs)
+            raise
+
     async def send_message(self, chat_id, text, *args, **kwargs):
-        return await super().send_message(chat_id, small_caps_html(text), *args, **kwargs)
+        return await self._call_with_emoji_fallback(super().send_message, chat_id, small_caps_html(text), *args, **kwargs)
 
     async def send_photo(self, chat_id, photo, *args, **kwargs):
         if kwargs.get("caption") is not None:
             kwargs["caption"] = small_caps_html(kwargs["caption"])
-        return await super().send_photo(chat_id, photo, *args, **kwargs)
+        return await self._call_with_emoji_fallback(super().send_photo, chat_id, photo, *args, **kwargs)
 
     async def edit_message_text(self, text, *args, **kwargs):
-        return await super().edit_message_text(small_caps_html(text), *args, **kwargs)
+        return await self._call_with_emoji_fallback(super().edit_message_text, small_caps_html(text), *args, **kwargs)
 
     async def edit_message_caption(self, *args, **kwargs):
         if kwargs.get("caption") is not None:
             kwargs["caption"] = small_caps_html(kwargs["caption"])
-        return await super().edit_message_caption(*args, **kwargs)
+        return await self._call_with_emoji_fallback(super().edit_message_caption, *args, **kwargs)
 
 bot = StyledBot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -196,7 +262,11 @@ def default_data():
         "channel_catalog": {},
         "users": {},
         "banned_users": [],
-        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
+        "orders": [],
+        "complaints": [],
+        "order_seq": 0,
+        "complaint_seq": 0,
+        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "button_emojis": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "referral_need": 3, "referral_vip_days": 3, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
     }
 
 
@@ -367,10 +437,12 @@ async def send_start(message: Message, user_id=None):
 def main_menu(user_id=None):
     # Foydalanuvchi yuborgan namunadagi joylashuv; mavjud funksiyalar olib tashlanmaydi.
     rows = [
-        [InlineKeyboardButton(text="🔎 Anime va Kino izlash", callback_data="search_menu")],
+        [InlineKeyboardButton(text="🍥 Anime qidirish", callback_data="sm:anime")],
+        [InlineKeyboardButton(text="🎞 Kino qidirish", callback_data="sm:kino")],
         [InlineKeyboardButton(text="👤 Hisobim", callback_data="account"), InlineKeyboardButton(text="👥 Referal", callback_data="referral")],
         [InlineKeyboardButton(text="💰 Balans", callback_data="account"), InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="❓ VIP o‘zi nima?", callback_data="vip_info")],
+        [InlineKeyboardButton(text="🛒 Buyurtma berish", callback_data="order_new"), InlineKeyboardButton(text="📝 Shikoyat", callback_data="complaint_new")],
         [InlineKeyboardButton(text="📖 Qo‘llanma", callback_data="guide")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -381,13 +453,60 @@ def main_reply_keyboard():
     return ReplyKeyboardRemove()
 
 
-def search_menu(user_id=None):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔢 Kod bo'yicha izlash", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo'yicha izlash", callback_data="search_name")],
-        [InlineKeyboardButton(text="🎞 Kinolar ro'yxati", callback_data="category_list:movie"), InlineKeyboardButton(text="📺 Seriallar ro'yxati", callback_data="category_list:series")],
-        [InlineKeyboardButton(text="🍥 Anime ro'yxati", callback_data="category_list:anime"), InlineKeyboardButton(text="🎨 Multfilmlar ro'yxati", callback_data="category_list:cartoon")],
-        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
-    ])
+SEARCH_KINDS = {
+    "anime": {
+        "title": "🍥 <b>Anime qidirish</b>\n\nKod yoki nom orqali anime toping.",
+        "name_prompt": "🍥 Anime nomini yozing. Har safar yuborganingizda mos animelar tanlash uchun chiqadi:",
+        "code_prompt": "🔢 Anime kodini yuboring:",
+        "empty": "❌ Bu bo‘yicha anime topilmadi. Boshqa kod yoki nom yozib ko‘ring:",
+    },
+    "kino": {
+        "title": "🎞 <b>Kino qidirish</b>\n\nKod yoki nom orqali kino, serial va multfilm toping.",
+        "name_prompt": "🎞 Kino, serial yoki multfilm nomini yozing. Har safar yuborganingizda mos nomlar tanlash uchun chiqadi:",
+        "code_prompt": "🔢 Kino yoki serial kodini yuboring:",
+        "empty": "❌ Bu bo‘yicha kino yoki serial topilmadi. Boshqa kod yoki nom yozib ko‘ring:",
+    },
+}
+
+
+def media_kind(media_type) -> str:
+    """anime bo‘lsa — anime bo‘limi, qolgan turlar (kino/serial/multfilm/drama) — kino bo‘limi."""
+    return "anime" if media_type == "anime" else "kino"
+
+
+def search_filter_matches(media_type, media_filter) -> bool:
+    if media_filter in SEARCH_KINDS:
+        return media_kind(media_type) == media_filter
+    if media_filter in (None, "", "all"):
+        return True
+    return media_type == media_filter
+
+
+def search_back_target(media_filter) -> str:
+    return f"sm:{media_filter}" if media_filter in SEARCH_KINDS else "search_menu"
+
+
+def search_menu(user_id=None, kind=None):
+    if kind == "anime":
+        rows = [
+            [InlineKeyboardButton(text="🔢 Kod bo'yicha izlash", callback_data="search:anime"), InlineKeyboardButton(text="🔠 Nom bo'yicha izlash", callback_data="search_name:anime")],
+            [InlineKeyboardButton(text="🍥 Anime ro'yxati", callback_data="category_list:anime")],
+        ]
+    elif kind == "kino":
+        rows = [
+            [InlineKeyboardButton(text="🔢 Kod bo'yicha izlash", callback_data="search:kino"), InlineKeyboardButton(text="🔠 Nom bo'yicha izlash", callback_data="search_name:kino")],
+            [InlineKeyboardButton(text="🎞 Kinolar ro'yxati", callback_data="category_list:movie"), InlineKeyboardButton(text="📺 Seriallar ro'yxati", callback_data="category_list:series")],
+            [InlineKeyboardButton(text="🎨 Multfilmlar ro'yxati", callback_data="category_list:cartoon")],
+        ]
+    else:
+        # Eski xabarlardagi "search_menu" tugmalari uchun umumiy menyu saqlanadi.
+        rows = [
+            [InlineKeyboardButton(text="🔢 Kod bo'yicha izlash", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo'yicha izlash", callback_data="search_name")],
+            [InlineKeyboardButton(text="🎞 Kinolar ro'yxati", callback_data="category_list:movie"), InlineKeyboardButton(text="📺 Seriallar ro'yxati", callback_data="category_list:series")],
+            [InlineKeyboardButton(text="🍥 Anime ro'yxati", callback_data="category_list:anime"), InlineKeyboardButton(text="🎨 Multfilmlar ro'yxati", callback_data="category_list:cartoon")],
+        ]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_menu(user_id=None):
@@ -423,12 +542,14 @@ def owner_menu():
         [InlineKeyboardButton(text="🔐 Admin huquqlarini sozlash", callback_data="admin_permissions")],
         [InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="add_channel"), InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="del_channel")],
         [InlineKeyboardButton(text="🎨 Tugma ranglari", callback_data="appearance")],
+        [InlineKeyboardButton(text="😀 Tugmalarga emoji qo'shish", callback_data="button_emoji_menu")],
         [InlineKeyboardButton(text="💾 Zaxira olish", callback_data="owner_backup"), InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="owner_restore_help")],
         [InlineKeyboardButton(text="🗄 Zaxira kanalini o'zgartirish", callback_data="backup_channel_change")],
         [InlineKeyboardButton(text="🛠 Texnik tanaffus: holat", callback_data="owner_maintenance")],
         [InlineKeyboardButton(text=("💎 VIP: O'CHIRISH" if load_data().get("settings", {}).get("vip_enabled", False) else "💎 VIP: YOQISH"), callback_data="owner_vip")],
         [InlineKeyboardButton(text=("🔐 Saqlash himoyasi: YOQILGAN" if load_data().get("settings", {}).get("vip_save_protection", True) else "🔓 Saqlash himoyasi: O'CHIRILGAN"), callback_data="owner_save_protection")],
         [InlineKeyboardButton(text="📣 Hammaga xabar yuborish", callback_data="broadcast")],
+        [InlineKeyboardButton(text="🛒 Buyurtmalar", callback_data="owner_orders"), InlineKeyboardButton(text="📝 Shikoyatlar", callback_data="owner_complaints")],
         [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
         [InlineKeyboardButton(text="👥 Obunachilarni boshqarish", callback_data="manage_users")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
@@ -478,7 +599,7 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
         if not visible_seasons:
             visible_seasons = season_keys
         for sn in visible_seasons:
-            row.append(InlineKeyboardButton(text=f"{sn}-fasl", callback_data=f"season_show:{code}:{sn}"))
+            row.append(InlineKeyboardButton(text=f"📺 {sn}-fasl", callback_data=f"season_show:{code}:{sn}"))
             if len(row) == 3:
                 rows.append(row); row=[]
         if row: rows.append(row)
@@ -515,7 +636,7 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
         if len(season_keys) > 1:
             rows.append([InlineKeyboardButton(text="⬅️ Fasllar", callback_data=f"season_show:{code}:choose")])
     rows.append([InlineKeyboardButton(text="♥️ Sevimlilarga qo‘shish", callback_data=f"favorite_add:{code}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=(f"sm:{media_kind(media.get('media_type'))}" if media else "search_menu"))])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -538,18 +659,69 @@ def media_caption(code: str, media: dict) -> str:
     return base[:1024]
 
 
+def vip_until_ts(user: dict) -> int:
+    """Saqlangan VIP tugash vaqtini epoch-soniyaga xavfsiz aylantiradi."""
+    if not isinstance(user, dict):
+        return 0
+    raw = user.get("vip_until", 0)
+    try:
+        if isinstance(raw, str):
+            text = raw.strip().replace(",", ".")
+            if not text:
+                return 0
+            try:
+                raw = float(text)
+            except ValueError:
+                parsed = datetime.fromisoformat(text)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return int(parsed.timestamp())
+        value = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    if value <= 0:
+        return 0
+    # Millisekundlarda yozib qo‘yilgan bo‘lsa, sekundga o‘tkazamiz.
+    if value > 10 ** 11:
+        value /= 1000
+    return int(value)
+
+
 def is_vip_user(user_id: int, data=None) -> bool:
     """Foydalanuvchining VIP muddati hali tugamaganini tekshiradi."""
     data = data or load_data()
-    user = data.get("users", {}).get(str(user_id), {})
-    return int(user.get("vip_until", 0) or 0) > now_ts()
+    users = data.get("users") or {}
+    user = users.get(str(user_id)) or users.get(user_id) or {}
+    return vip_until_ts(user) > now_ts()
+
+
+def as_bool(value, default=False) -> bool:
+    """Sozlama JSONdan matn ko‘rinishida qaytgan bo‘lsa ham to‘g‘ri o‘qiydi."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().casefold().replace("‘", "'").replace("’", "'")
+        if text in {"1", "true", "yes", "on", "ha", "yoq", "yoqilgan"}:
+            return True
+        if text in {"0", "false", "no", "off", "yo'q", "yoq emas", "o'chirilgan", "ochirilgan", ""}:
+            return False
+        return default
+    return default if value is None else bool(value)
 
 
 def should_protect_content(user_id: int, data=None) -> bool:
     """Himoya yoqilgan bo‘lsa, faqat VIP bo‘lmaganlarga saqlash/forwardni cheklaydi."""
     data = data or load_data()
-    enabled = bool(data.get("settings", {}).get("vip_save_protection", True))
-    return enabled and not is_vip_user(user_id, data)
+    # Bot egasi kontent egasi — unga cheklov qo‘yilmaydi.
+    if is_owner(user_id):
+        return False
+    enabled = as_bool(data.get("settings", {}).get("vip_save_protection", True), True)
+    vip = is_vip_user(user_id, data)
+    protect = enabled and not vip
+    logging.info("Saqlash himoyasi: user=%s vip=%s enabled=%s protect=%s", user_id, vip, enabled, protect)
+    return protect
 
 
 def media_available_for_user(user_id: int, media: dict, data=None) -> bool:
@@ -603,12 +775,20 @@ class Form(StatesGroup):
     owner_backup_channel = State()
     broadcast_message = State()
     button_text_value = State()
+    button_emoji_value = State()
     edit_poster_code = State()
     edit_poster_file = State()
     admin_permissions_id = State()
     manage_vip_days = State()
     manage_balance_amount = State()
     manage_mute_duration = State()
+    manage_vip_amount = State()
+    manage_tx_desc = State()
+    manage_tx_media = State()
+    manage_tx_confirm = State()
+    request_text = State()
+    request_confirm = State()
+    request_reply = State()
 
 
 def parse_channel_entry(entry):
@@ -629,10 +809,42 @@ def parse_channel_entry(entry):
     return chat_ref, invite_url, raw
 
 
-async def check_subscription(user_id: int) -> bool:
-    channels = load_data().get("channels", [])
+def channel_aliases(chat_ref, invite_url="") -> set:
+    """Kanalni ID, @username va taklif havolasi ko'rinishlarida solishtirish uchun kalitlar."""
+    aliases = set()
+    def add(value):
+        value = str(value or "").strip()
+        if value:
+            aliases.add(value)
+            aliases.add(value.casefold())
+    add(chat_ref)
+    add(invite_url)
+    add(str(invite_url or "").strip().rstrip("/"))
+    ref = str(chat_ref or "").strip()
+    if ref.startswith("@"):
+        add(ref[1:])
+    elif "t.me/" in ref:
+        tail = ref.split("t.me/", 1)[1].strip("/")
+        if tail and not tail.startswith("+"):
+            add(tail)
+            add("@" + tail)
+    return aliases
+
+
+async def check_subscription(user_id: int, ignore_vip: bool = False) -> bool:
+    data = load_data()
+    # VIP foydalanuvchi barcha majburiy obuna talablaridan ozod.
+    # Referal esa faqat haqiqiy obuna bo'lganda hisoblanishi uchun ignore_vip bilan tekshiriladi.
+    if not ignore_vip and is_vip_user(user_id, data):
+        return True
+    channels = data.get("channels", [])
+    pending_requests = data.setdefault("join_requests", {})
+    requested_channel_ids = {str(x) for x in pending_requests.get(str(user_id), [])}
     for entry in channels:
         chat_ref, _invite_url, raw = parse_channel_entry(entry)
+        # Maxfiy kanalga qo'shilish so'rovi yuborilgan bo'lsa, admin tasdig'ini kutmaymiz.
+        if channel_aliases(chat_ref, _invite_url) & requested_channel_ids:
+            continue
         try:
             member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
             # Restricted a'zolar ham is_member=True bo'lsa obunachi hisoblanadi.
@@ -650,6 +862,232 @@ async def check_subscription(user_id: int) -> bool:
     return True
 
 
+PURGE_TEXT = ("⚠️ <b>Diqqat!</b>\n\n"
+              "Siz majburiy obunadagi kanaldan chiqib ketganingiz sababli "
+              "chatdagi kinolar o'chirildi.\n\n"
+              "Qayta foydalanish uchun kanallarga obuna bo'ling yoki 💎 VIP oling.")
+
+
+def track_media_msg(user_id: int, message_id, vip=None):
+    """Foydalanuvchiga yuborilgan kino (media) xabarini eslab qoladi.
+
+    VIP faol paytda yuborilganlar alohida saqlanadi — VIP tugagach o'shalar o'chiriladi.
+    """
+    if not message_id:
+        return
+    data = load_data()
+    user = data.setdefault("users", {}).setdefault(str(user_id), {})
+    ids = [int(x) for x in (user.get("media_msgs") or [])]
+    ids.append(int(message_id))
+    user["media_msgs"] = ids[-300:]
+    if vip is None:
+        vip = is_vip_user(user_id, data)
+    if vip:
+        vip_ids = [int(x) for x in (user.get("vip_media_msgs") or [])]
+        vip_ids.append(int(message_id))
+        user["vip_media_msgs"] = vip_ids[-300:]
+    save_data(data)
+
+
+async def purge_user_media(user_id: int, notify: bool = True) -> int:
+    """Obunadan chiqqan foydalanuvchi chatidan bot yuborgan kinolarni o'chiradi.
+    Matnlar va tugmalar tegilmaydi. VIP foydalanuvchilar ozod."""
+    data = load_data()
+    if is_vip_user(user_id, data):
+        return 0
+    user = data.get("users", {}).get(str(user_id))
+    if not user:
+        return 0
+    ids = [int(x) for x in (user.get("media_msgs") or [])]
+    if not ids:
+        return 0
+    deleted = 0
+    for mid in ids:
+        try:
+            await bot.delete_message(user_id, mid)
+            deleted += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.04)
+    user["media_msgs"] = []
+    user["vip_media_msgs"] = []
+    save_data(data)
+    if notify and deleted:
+        try:
+            await bot.send_message(user_id, PURGE_TEXT)
+        except Exception:
+            pass
+    return deleted
+
+
+async def enforce_subscription(user_id: int) -> bool:
+    """Obunani tekshiradi.
+
+    Kinolar faqat kanaldagi «chiqib ketdi» xabaridan (chat_member update) aniqlangan
+    foydalanuvchilardan o'chiriladi — kanal qo'shilganda hammani jazolab bo'lmaydi.
+    Obuna tasdiqlanganda referal ham bir marta hisoblanadi.
+    """
+    allowed = await check_subscription(user_id)
+    if allowed:
+        await credit_referral(user_id)
+    return allowed
+
+
+async def purge_vip_media(user_id: int, user: dict) -> int:
+    """VIP faol paytda yuborilgan kinolarni chatdan o'chiradi."""
+    ids = [int(x) for x in (user.get("vip_media_msgs") or [])]
+    if not ids:
+        return 0
+    removed = set(ids)
+    deleted = 0
+    for mid in ids:
+        try:
+            await bot.delete_message(user_id, mid)
+            deleted += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.04)
+    user["vip_media_msgs"] = []
+    user["media_msgs"] = [x for x in (user.get("media_msgs") or []) if int(x) not in removed]
+    return deleted
+
+
+# ================= REFERAL TIZIMI =================
+REF_PREFIX = "ref_"
+REFERRAL_RULES = (
+    "• Har <b>{need} ta</b> do‘stingiz havola orqali botga kirsa — "
+    "<b>{vip_days} kunlik VIP</b> olasiz.\n"
+    "• Referal faqat do‘stingiz <b>barcha majburiy kanallarga obuna bo‘lgandan keyin</b> hisoblanadi.\n"
+    "• VIP muddati tugagach, VIP orqali ochilgan kinolar chatdan o‘chiriladi."
+)
+
+
+def ref_settings(data=None):
+    data = data or load_data()
+    cfg = data.get("settings", {})
+    need = max(1, int(cfg.get("referral_need", 3) or 3))
+    vip_days = max(1, int(cfg.get("referral_vip_days", 3) or 3))
+    return need, vip_days
+
+
+def parse_ref_payload(payload: str):
+    """«ref_123» yoki eski «123» ko‘rinishidagi start parametrini o‘qiydi."""
+    payload = str(payload or "").strip()
+    if payload.casefold().startswith(REF_PREFIX):
+        payload = payload[len(REF_PREFIX):]
+    if not payload.isdigit():
+        return None
+    value = int(payload)
+    return value if value > 0 else None
+
+
+def record_referrer(data, user_id: int, payload: str) -> bool:
+    """Yangi foydalanuvchiga taklif qiluvchini biriktiradi (faqat bir marta)."""
+    referrer = parse_ref_payload(payload)
+    if not referrer or referrer == int(user_id):
+        return False
+    users = data.setdefault("users", {})
+    if str(referrer) not in users:
+        return False
+    user = users.setdefault(str(user_id), {})
+    if user.get("referrer"):
+        return False
+    user["referrer"] = str(referrer)
+    user["referral_qualified"] = False
+    return True
+
+
+_REFERRAL_INFLIGHT = set()
+
+
+async def credit_referral(user_id: int) -> bool:
+    """Do‘st barcha kanallarga obuna bo‘lgach referalni hisoblaydi va VIP beradi."""
+    if int(user_id) in _REFERRAL_INFLIGHT:
+        return False
+    _REFERRAL_INFLIGHT.add(int(user_id))
+    try:
+        return await _credit_referral(user_id)
+    finally:
+        _REFERRAL_INFLIGHT.discard(int(user_id))
+
+
+async def _credit_referral(user_id: int) -> bool:
+    data = load_data()
+    users = data.get("users", {})
+    user = users.get(str(user_id))
+    if not user:
+        return False
+    referrer_key = str(user.get("referrer") or "")
+    if not referrer_key or user.get("referral_qualified") or user.get("referral_invalid"):
+        return False
+    inviter = users.get(referrer_key)
+    if not inviter:
+        user["referral_invalid"] = True
+        save_data(data)
+        return False
+    # VIP bo‘lishning o‘zi yetarli emas — barcha majburiy kanallarga a’zolik shart.
+    if not await check_subscription(user_id, ignore_vip=True):
+        return False
+    user["referral_qualified"] = True
+    user["referral_qualified_at"] = now_ts()
+    need, vip_days = ref_settings(data)
+    count = int(inviter.get("referrals_count", 0) or 0) + 1
+    inviter["referrals_count"] = count
+    reward_given = count % need == 0
+    if reward_given:
+        base = max(now_ts(), vip_until_ts(inviter))
+        inviter["vip_until"] = base + vip_days * 86400
+        inviter["referral_rewards"] = int(inviter.get("referral_rewards", 0) or 0) + 1
+        inviter.pop("vip_warned_until", None)
+    save_data(data)
+    logging.info("Referal hisoblandi: user=%s referrer=%s count=%s", user_id, referrer_key, count)
+    if reward_given:
+        try:
+            await bot.send_message(
+                int(referrer_key),
+                "🎉 <b>Tabriklaymiz!</b>\n\n"
+                f"👥 Taklif qilgan do‘stlaringiz: <b>{count}</b> ta\n"
+                f"💎 Mukofot: <b>{vip_days} kunlik VIP</b>\n"
+                f"⏳ VIP tugash vaqti: <b>{fmt_date(inviter['vip_until'])}</b>",
+            )
+        except Exception:
+            logging.info("Referal mukofoti xabari yuborilmadi: %s", referrer_key)
+    return True
+
+
+async def referral_text_and_link(user_id: int):
+    data = load_data()
+    user = data.get("users", {}).get(str(user_id), {})
+    count = int(user.get("referrals_count", 0) or 0)
+    need, vip_days = ref_settings(data)
+    left = need - (count % need)
+    rewards = int(user.get("referral_rewards", 0) or 0)
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start={REF_PREFIX}{user_id}"
+    text = (
+        "👥 <b>Referal tizimi</b>\n\n"
+        "🔗 Sizning taklif havolangiz:\n"
+        f"<code>{link}</code>\n\n"
+        "📋 <b>Qoidalar:</b>\n"
+        + REFERRAL_RULES.format(need=need, vip_days=vip_days)
+        + "\n\n"
+        f"📊 Taklif qilgan do‘stlar: <b>{count}</b> ta\n"
+        f"🎁 Keyingi mukofotgacha: <b>{left}</b> ta do‘st\n"
+        f"👑 Olingan VIP mukofotlar: <b>{rewards}</b> marta"
+    )
+    return text, link
+
+
+def referral_keyboard(link: str):
+    share = "https://t.me/share/url?url=" + quote(link) + "&text=" + quote(
+        "Do‘stim, bu botda kino va seriallar bor. Havola orqali kiring:"
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Do‘stlarga ulashish", url=share)],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
+    ])
+
+
 def subscription_keyboard():
     rows = []
     for entry in load_data().get("channels", []):
@@ -659,6 +1097,8 @@ def subscription_keyboard():
             label = str(chat_ref) if str(chat_ref).startswith("@") else "Maxfiy kanal"
             rows.append([InlineKeyboardButton(text=f"📢 {label}", url=invite_url)])
     rows.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")])
+    # VIP sotib olgan foydalanuvchi majburiy obunasiz foydalanadi.
+    rows.append([InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -672,10 +1112,11 @@ async def require_subscription_message(message: Message) -> bool:
     if mute_until > now_ts():
         await message.answer(f"🔇 Botdan foydalanish vaqtincha cheklangan.\nQayta foydalanish: {fmt_date(mute_until)}")
         return False
-    if await check_subscription(message.from_user.id):
+    if await enforce_subscription(message.from_user.id):
         return True
     await message.answer(
-        "🔒 <b>Botdan foydalanishdan oldin majburiy kanallarga obuna bo'ling.</b>",
+        "🔒 <b>Botdan foydalanishdan oldin majburiy kanallarga obuna bo'ling.</b>\n\n"
+        "📢 Kanallarga qo'shiling yoki 💎 VIP oling — VIP obunasida majburiy obuna talab qilinmaydi.",
         reply_markup=subscription_keyboard()
     )
     return False
@@ -688,25 +1129,41 @@ async def start(message: Message, state: FSMContext):
     # create_task bilan parallel ishlatish yangi userni oldindan saqlab, xabarni o'tkazib yuborardi.
     await notify_new_user(message.from_user)
     data = load_data()
-    ensure_user(data, message.from_user)
+    _user, is_new = ensure_user(data, message.from_user)
+    # Referal havolasi: /start ref_123 (eski /start 123 ham qo'llanadi).
+    parts = (message.text or "").split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+    if is_new and payload:
+        record_referrer(data, message.from_user.id, payload)
     save_data(data)
     if int(message.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         return await message.answer("⛔ Siz botdan foydalanishdan chetlatilgansiz.")
     _u = data.get("users", {}).get(str(message.from_user.id), {})
     if int(_u.get("mute_until", 0) or 0) > now_ts():
         return await message.answer(f"🔇 Botdan foydalanish vaqtincha cheklangan.\nQayta foydalanish: {fmt_date(int(_u['mute_until']))}")
-    if not await check_subscription(message.from_user.id):
-        return await message.answer("🔒 <b>Botdan foydalanishdan oldin majburiy kanallarga obuna bo‘ling.</b>", reply_markup=subscription_keyboard())
+    if not await enforce_subscription(message.from_user.id):
+        return await message.answer("🔒 <b>Botdan foydalanishdan oldin majburiy kanallarga obuna bo‘ling.</b>\n\n📢 Kanallarga qo'shiling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
     await send_start(message)
+
+
+@dp.message(Command("ref"))
+async def ref_command(message: Message, state: FSMContext):
+    """Obunachiga referal havolasi va qoidalarini ko'rsatadi."""
+    await state.clear()
+    if not await require_subscription_message(message):
+        return
+    text, link = await referral_text_and_link(message.from_user.id)
+    await message.answer(text, reply_markup=referral_keyboard(link))
 
 
 @dp.callback_query(F.data == "owner_settings")
 async def owner_settings_callback(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     cfg = load_data().get("settings", {})
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"👥 Referal mukofoti: {cfg.get('referral_reward', 5000)} so‘m", callback_data="setcfg:referral_reward")],
+        [InlineKeyboardButton(text=f"👥 Referal: {cfg.get('referral_need', 3)} do‘st", callback_data="setcfg:referral_need")],
+        [InlineKeyboardButton(text=f"🎁 Referal mukofoti: {cfg.get('referral_vip_days', 3)} kunlik VIP", callback_data="setcfg:referral_vip_days")],
         [InlineKeyboardButton(text=f"👑 VIP 1 oy narxi: {cfg.get('vip_month_price', 15000)} so‘m", callback_data="setcfg:vip_month_price")],
         [InlineKeyboardButton(text=f"📅 VIP maksimal muddati: {cfg.get('vip_max_months', 6)} oy", callback_data="setcfg:vip_max_months")],
         [InlineKeyboardButton(text=f"⏳ VIP oy davomiyligi: {cfg.get('vip_duration_days', 30)} kun", callback_data="setcfg:vip_duration_days")],
@@ -724,18 +1181,19 @@ async def owner_settings_callback(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("setcfg:"))
 async def owner_setting_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     key = call.data.split(":", 1)[1]
     prompts = {
         "admin_contact": "To‘lov adminining username sini yuboring, masalan @obidov_xz:",
         "vip_month_price": "VIP obunasining 1 oylik narxini so‘mda yuboring:",
-        "referral_reward": "Har bir referal uchun beriladigan mukofotni so‘mda yuboring:",
+        "referral_need": "Nechta do‘st taklif qilinganda mukofot berilsin (masalan, 3):",
+        "referral_vip_days": "Referal mukofoti necha kunlik VIP bo‘lsin (masalan, 3):",
         "vip_max_months": "VIP uchun ruxsat etilgan maksimal oy sonini yuboring:",
         "vip_duration_days": "VIP obunasining bir oyi necha kun bo‘lishini yuboring:",
         "early_view_days": "VIP erta ko‘rish necha kun oldin bo‘lishini yuboring:",
     }
     if key not in prompts:
-        return await call.answer("Noma'lum sozlama", show_alert=True)
+        return await call.answer("⚠️ Noma'lum sozlama", show_alert=True)
     await state.set_state(Form.owner_setting_value)
     await state.update_data(setting_key=key)
     await call.message.answer("⚙️ " + prompts[key] + "\nBekor qilish: /cancel")
@@ -749,7 +1207,7 @@ async def owner_setting_save(message: Message, state: FSMContext):
         return await message.answer("⛔ Faqat owner uchun.")
     if (message.text or "").strip() == "/cancel":
         await state.clear()
-        return await message.answer("Bekor qilindi.", reply_markup=owner_menu())
+        return await message.answer("✅ Bekor qilindi.", reply_markup=owner_menu())
     saved = await state.get_data()
     key = saved.get("setting_key")
     raw = (message.text or "").strip()
@@ -758,44 +1216,44 @@ async def owner_setting_save(message: Message, state: FSMContext):
         try:
             value = int(raw)
         except ValueError:
-            return await message.answer("Faqat raqam yuboring:")
+            return await message.answer("🔢 Faqat raqam yuboring:")
         low, high = limits[key]
         if not low <= value <= high:
-            return await message.answer(f"Qiymat {low} dan {high} gacha bo'lishi kerak. Qayta yuboring:")
+            return await message.answer(f"⚠️ Qiymat {low} dan {high} gacha bo'lishi kerak. Qayta yuboring:")
     elif key == "admin_contact":
         value = raw
         if not value.startswith("@") or len(value) < 2 or " " in value:
-            return await message.answer("Username @ bilan boshlansin, masalan @AnimBot_Admin. Qayta yuboring:")
-    elif key in {"vip_max_months", "vip_duration_days", "early_view_days", "vip_month_price", "referral_reward"}:
+            return await message.answer("⚠️ Username @ bilan boshlansin, masalan @AnimBot_Admin. Qayta yuboring:")
+    elif key in {"vip_max_months", "vip_duration_days", "early_view_days", "vip_month_price", "referral_need", "referral_vip_days"}:
         try: value = int(raw)
-        except ValueError: return await message.answer("Faqat raqam yuboring:")
-        if value < 0: return await message.answer("Qiymat manfiy bo‘lishi mumkin emas:")
-        if key in {"vip_max_months", "vip_duration_days"} and value < 1:
-            return await message.answer("Bu qiymat kamida 1 bo‘lishi kerak:")
+        except ValueError: return await message.answer("🔢 Faqat raqam yuboring:")
+        if value < 0: return await message.answer("⚠️ Qiymat manfiy bo‘lishi mumkin emas:")
+        if key in {"vip_max_months", "vip_duration_days", "referral_need", "referral_vip_days"} and value < 1:
+            return await message.answer("⚠️ Bu qiymat kamida 1 bo‘lishi kerak:")
     else:
         await state.clear()
-        return await message.answer("Sozlama topilmadi.")
+        return await message.answer("❌ Sozlama topilmadi.")
     data = load_data()
     data.setdefault("settings", {})[key] = value
     save_data(data)
     await state.clear()
-    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_reward": "Referal mukofoti", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
+    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_need": "Referal uchun kerakli do‘stlar soni", "referral_vip_days": "Referal mukofoti (kun)", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
     await message.answer(f"✅ {labels.get(key, key)} yangilandi: <b>{value}</b>\nO‘zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
 
 
 @dp.callback_query(F.data == "manage_users")
 async def manage_users_callback(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Adminlar uchun", show_alert=True)
+        return await call.answer("⛔ Adminlar uchun", show_alert=True)
     await state.set_state(Form.manage_user_id)
-    await call.message.answer("👥 <b>Obunachilarni boshqarish</b>\nBoshqariladigan foydalanuvchi ID sini yuboring:")
+    await call.message.answer("👥 <b>Obunachilarni boshqarish</b>\n🆔 Boshqariladigan foydalanuvchi ID sini yuboring:")
     await call.answer()
 
 
 @dp.callback_query(F.data == "backup_channel_change")
 async def backup_channel_change_callback(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     current = get_backup_channel_id() or "sozlanmagan"
     await state.set_state(Form.owner_backup_channel)
     await call.message.answer(
@@ -816,7 +1274,7 @@ async def backup_channel_change_save(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
     if raw == "/cancel":
         await state.clear()
-        return await message.answer("Bekor qilindi.", reply_markup=owner_menu())
+        return await message.answer("✅ Bekor qilindi.", reply_markup=owner_menu())
     data = load_data()
     if raw.casefold() in {"off", "o‘chirish", "ochirish"}:
         data.setdefault("settings", {}).pop("backup_channel_id", None)
@@ -838,7 +1296,7 @@ async def backup_channel_change_save(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "owner_backup")
 async def owner_backup_callback(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     data = load_data()
     payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     doc = BufferedInputFile(payload, filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
@@ -857,7 +1315,7 @@ async def owner_backup_callback(call: CallbackQuery):
 @dp.callback_query(F.data == "owner_restore_help")
 async def owner_restore_help(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     await state.set_state(Form.owner_restore_file)
     await state.update_data(restore_files=0)
     await call.message.answer(
@@ -914,7 +1372,7 @@ async def owner_restore_file(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer(f"✅ Tiklandi. {files_count} ta JSON fayl birlashtirildi; jami {len(restored.get('medias', {}))} ta kontent kodi mavjud.", reply_markup=owner_menu())
     if not message.document:
-        return await message.answer("JSON yoki ichida JSON fayllari bo'lgan ZIP arxiv yuboring. Bir nechta fayl uchun oxirida /done yozing.")
+        return await message.answer("📄 JSON yoki ichida JSON fayllari bo'lgan ZIP arxiv yuboring. Bir nechta fayl uchun oxirida /done yozing.")
     fname = (message.document.file_name or "").lower()
     if not (fname.endswith(".json") or fname.endswith(".zip")):
         return await message.answer("❌ Faqat .json yoki .zip fayl qabul qilinadi.")
@@ -945,7 +1403,7 @@ async def owner_restore_file(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "owner_maintenance")
 async def owner_maintenance_callback(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     data = load_data(); cfg = data.setdefault("settings", {})
     cfg["maintenance"] = not bool(cfg.get("maintenance", False)); save_data(data)
     status = "YOQILDI" if cfg["maintenance"] else "O'CHIRILDI"
@@ -955,7 +1413,7 @@ async def owner_maintenance_callback(call: CallbackQuery):
 @dp.callback_query(F.data == "owner_vip")
 async def owner_vip_callback(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     data = load_data(); cfg = data.setdefault("settings", {})
     cfg["vip_enabled"] = not bool(cfg.get("vip_enabled", False)); save_data(data)
     status = "YOQILDI" if cfg["vip_enabled"] else "O'CHIRILDI"
@@ -966,7 +1424,7 @@ async def owner_vip_callback(call: CallbackQuery):
 @dp.callback_query(F.data == "owner_save_protection")
 async def owner_save_protection_callback(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     data = load_data()
     cfg = data.setdefault("settings", {})
     cfg["vip_save_protection"] = not bool(cfg.get("vip_save_protection", True))
@@ -989,7 +1447,7 @@ async def owner_save_protection_callback(call: CallbackQuery):
 async def vip_info_callback(call: CallbackQuery):
     cfg = load_data().get("settings", {})
     if not cfg.get("vip_enabled", False) and not is_owner(call.from_user.id):
-        return await call.answer("VIP hozircha o‘chirilgan.", show_alert=True)
+        return await call.answer("💎 VIP hozircha o‘chirilgan.", show_alert=True)
     price = int(cfg.get("vip_month_price", 15000) or 15000)
     text = (
         "👑 <b>VIP — tomoshadan ko‘proq zavq oling!</b>\n\n"
@@ -1015,7 +1473,7 @@ async def vip_info_callback(call: CallbackQuery):
 async def vip_buy_callback(call: CallbackQuery):
     data = load_data(); cfg = data.get("settings", {})
     if not cfg.get("vip_enabled", False) and not is_owner(call.from_user.id):
-        return await call.answer("VIP hozircha o'chirilgan.", show_alert=True)
+        return await call.answer("💎 VIP hozircha o'chirilgan.", show_alert=True)
     price = int(cfg.get("vip_month_price", 15000) or 15000)
     max_months = max(1, min(24, int(cfg.get("vip_max_months", 6) or 6)))
     rows = [[InlineKeyboardButton(text=f"{m} oy — {price*m:,} so'm".replace(',', ' '), callback_data=f"vip_plan:{m}")] for m in range(1, max_months+1)]
@@ -1029,16 +1487,16 @@ async def vip_buy_callback(call: CallbackQuery):
 async def vip_plan_callback(call: CallbackQuery):
     data=load_data(); cfg=data.get("settings", {})
     if not cfg.get("vip_enabled", False) and not is_owner(call.from_user.id):
-        return await call.answer("VIP hozircha o'chirilgan.", show_alert=True)
+        return await call.answer("💎 VIP hozircha o'chirilgan.", show_alert=True)
     try: months=int(call.data.split(':',1)[1])
-    except ValueError: return await call.answer("Muddat noto'g'ri", show_alert=True)
+    except ValueError: return await call.answer("⚠️ Muddat noto'g'ri", show_alert=True)
     max_months=max(1,min(24,int(cfg.get('vip_max_months',6) or 6)))
-    if not 1 <= months <= max_months: return await call.answer("Bu muddat mavjud emas", show_alert=True)
+    if not 1 <= months <= max_months: return await call.answer("⚠️ Bu muddat mavjud emas", show_alert=True)
     price=int(cfg.get('vip_month_price',15000) or 15000)*months
     user=data.setdefault('users',{}).setdefault(str(call.from_user.id),{})
     balance=float(user.get('balance',0) or 0)
     if balance < price:
-        return await call.answer(f"Balansingiz yetarli emas. Kerak: {price:,} so'm; balans: {balance:g} so'm".replace(',', ' '), show_alert=True)
+        return await call.answer(f"💰 Balansingiz yetarli emas. Kerak: {price:,} so'm; balans: {balance:g} so'm".replace(',', ' '), show_alert=True)
     kb=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Ha, sotib olaman", callback_data=f"vip_confirm:{months}")],
         [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="vip_buy")]
@@ -1051,31 +1509,31 @@ async def vip_plan_callback(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("vip_confirm:"))
 async def vip_confirm_callback(call: CallbackQuery):
     try: months=int(call.data.split(':',1)[1])
-    except ValueError: return await call.answer("Muddat noto'g'ri",show_alert=True)
+    except ValueError: return await call.answer("⚠️ Muddat noto'g'ri",show_alert=True)
     data=load_data(); cfg=data.get('settings',{})
-    if not cfg.get('vip_enabled',False) and not is_owner(call.from_user.id): return await call.answer("VIP hozircha o'chirilgan.",show_alert=True)
+    if not cfg.get('vip_enabled',False) and not is_owner(call.from_user.id): return await call.answer("💎 VIP hozircha o'chirilgan.",show_alert=True)
     max_months=max(1,min(24,int(cfg.get('vip_max_months',6) or 6)))
-    if not 1 <= months <= max_months: return await call.answer("Muddat noto'g'ri",show_alert=True)
+    if not 1 <= months <= max_months: return await call.answer("⚠️ Muddat noto'g'ri",show_alert=True)
     user=data.setdefault('users',{}).setdefault(str(call.from_user.id),{})
     price=int(cfg.get('vip_month_price',15000) or 15000)*months
     balance=float(user.get('balance',0) or 0)
-    if balance < price: return await call.answer("Balansingiz yetarli emas.",show_alert=True)
+    if balance < price: return await call.answer("💰 Balansingiz yetarli emas.",show_alert=True)
     # Takroriy callbackdan ikki marta pul yechilmasligi uchun balans tekshiruvi va yozish bir amalda.
     user['balance']=balance-price
-    base=max(now_ts(),int(user.get('vip_until',0) or 0))
+    base=max(now_ts(),vip_until_ts(user))
     user['vip_until']=base+months*int(cfg.get('vip_duration_days',30) or 30)*86400
     user.pop('vip_warned_until',None)
     save_data(data)
     text=f"✅ <b>VIP faollashtirildi!</b>\nMuddat: {months} oy\nTo'landi: {price:,} so'm\nQolgan balans: {user['balance']:g} so'm\nTugash vaqti: {fmt_date(user['vip_until'])}".replace(',', ' ')
     try: await call.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy menyu",callback_data="home")]]))
     except Exception: await call.message.answer(text)
-    await call.answer("VIP sotib olindi")
+    await call.answer("✅ VIP sotib olindi")
 
 
 @dp.callback_query(F.data == "admin_home")
 async def admin_home_callback(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        return await call.answer("Adminlar uchun", show_alert=True)
+        return await call.answer("⛔ Adminlar uchun", show_alert=True)
     if is_owner(call.from_user.id):
         await call.message.answer("👑 <b>Owner paneli</b>", reply_markup=owner_menu())
     else:
@@ -1090,7 +1548,7 @@ async def manage_user_command(message: Message, state: FSMContext):
     parts = (message.text or "").split()
     if len(parts) == 1:
         await state.set_state(Form.manage_user_id)
-        return await message.answer("Boshqariladigan foydalanuvchi Telegram ID sini yuboring:")
+        return await message.answer("🆔 Boshqariladigan foydalanuvchi Telegram ID sini yuboring:")
     await show_user_management(message, int(parts[1]))
 
 
@@ -1100,7 +1558,7 @@ async def show_user_management(message: Message, user_id: int):
     if not user:
         return await message.answer("❌ Bu foydalanuvchi bazada topilmadi. U botda /start bosgan bo‘lishi kerak.")
     banned = user_id in [int(x) for x in data.get("banned_users", [])]
-    vip_until = int(user.get("vip_until", 0) or 0)
+    vip_until = vip_until_ts(user)
     mute_until = int(user.get("mute_until", 0) or 0)
     balance = float(user.get("balance", 0) or 0)
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1114,6 +1572,7 @@ async def show_user_management(message: Message, user_id: int):
         f"👤 <b>Foydalanuvchi</b>\nID: <code>{user_id}</code>\nUsername: @{user.get('username') or 'yo‘q'}"
         f"\nVIP: {'Faol (' + fmt_date(vip_until) + ')' if vip_until > now_ts() else 'Faol emas'}"
         f"\nBalans: {balance:g} so‘m\nMute: {fmt_date(mute_until) if mute_until > now_ts() else 'Yo‘q'}"
+        f"\nSaqlash/uzatish: {'cheklangan' if should_protect_content(user_id, data) else 'erkin'}"
         f"\nBan: {'Ha' if banned else 'Yo‘q'}", reply_markup=kb)
 
 
@@ -1125,7 +1584,7 @@ async def manage_user_id_save(message: Message, state: FSMContext):
     try:
         user_id = int((message.text or "").strip())
     except ValueError:
-        return await message.answer("Faqat Telegram ID raqamini yuboring:")
+        return await message.answer("🆔 Faqat Telegram ID raqamini yuboring:")
     await state.clear()
     await show_user_management(message, user_id)
 
@@ -1133,7 +1592,7 @@ async def manage_user_id_save(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("userban:"))
 async def user_ban_callback(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Adminlar uchun", show_alert=True)
+        return await call.answer("⛔ Adminlar uchun", show_alert=True)
     user_id = int(call.data.split(":", 1)[1])
     data = load_data()
     banned = [int(x) for x in data.get("banned_users", [])]
@@ -1144,7 +1603,7 @@ async def user_ban_callback(call: CallbackQuery):
         data.setdefault("banned_users", []).append(user_id)
         result = "ban qilindi"
     save_data(data)
-    await call.answer(f"Foydalanuvchi {result}", show_alert=True)
+    await call.answer(f"👤 Foydalanuvchi {result}", show_alert=True)
     await show_user_management(call.message, user_id)
 
 
@@ -1158,65 +1617,296 @@ async def user_ban_callback(call: CallbackQuery):
 
 
 
+# ---- Qo'lda pul o'tkazish / VIP berish ----
+
+TX_MEDIA_LABELS = {"photo": "🖼 Rasm", "video": "🎬 Video", "sticker": "🎨 Stiker",
+                   "document": "📄 Fayl", "animation": "🎞 GIF"}
+
+
+def _tx_money(value) -> str:
+    return f"{float(value or 0):,.0f}".replace(",", " ")
+
+
+def _tx_media_label(tx: dict) -> str:
+    return TX_MEDIA_LABELS.get(str(tx.get("media_type") or ""), "yo‘q")
+
+
+def _tx_user_text(tx: dict, balance: float, vip_until: int = 0) -> str:
+    kind = tx.get("kind")
+    lines = []
+    if kind == "vip":
+        days = int(tx.get("days") or 0)
+        lines += ["💎 <b>VIP obunangiz faollashtirildi!</b>", ""]
+        lines.append("📅 Muddat: <b>cheksiz</b>" if days == 0 else f"📅 Muddat: <b>{days} kun</b>")
+        if vip_until:
+            lines.append(f"⏳ Tugash vaqti: <b>{fmt_date(vip_until)}</b>")
+        amount = float(tx.get("amount") or 0)
+        if amount > 0:
+            lines.append(f"💰 To‘lov: <b>{_tx_money(amount)} so‘m</b> — balansingizga qo‘shildi")
+    elif kind == "out":
+        lines += ["💰 <b>Balansingizdan pul yechildi</b>", "",
+                  f"➖ Yechildi: <b>{_tx_money(tx.get('charged'))} so‘m</b>"]
+    else:
+        lines += ["💰 <b>Balansingiz to‘ldirildi</b>", "",
+                  f"➕ Qo‘shildi: <b>{_tx_money(tx.get('amount'))} so‘m</b>"]
+    lines.append(f"💳 Balansingiz: <b>{_tx_money(balance)} so‘m</b>")
+    if tx.get("desc"):
+        lines += ["", f"📝 Izoh: {_esc(str(tx['desc']))}"]
+    lines += ["", f"🕒 {datetime.now().strftime('%d.%m.%Y %H:%M')}"]
+    return "\n".join(lines)
+
+
+def _tx_confirm_text(tx: dict) -> str:
+    user = load_data().get("users", {}).get(str(tx["uid"]), {})
+    balance = float(user.get("balance", 0) or 0)
+    name = user.get("first_name") or user.get("username") or "-"
+    lines = ["🧾 <b>Amalni tasdiqlang</b>", "",
+             f"👤 Foydalanuvchi: <b>{_esc(str(name))}</b>",
+             f"🆔 ID: <code>{tx['uid']}</code>"]
+    if tx.get("kind") == "vip":
+        days = int(tx.get("days") or 0)
+        lines.append("💎 VIP: <b>cheksiz</b>" if days == 0 else f"💎 VIP: <b>{days} kun</b>")
+    if float(tx.get("amount") or 0) > 0:
+        shown = min(float(tx["amount"]), balance) if tx.get("kind") == "out" else float(tx["amount"])
+        verb = "Balansdan yechiladi" if tx.get("kind") == "out" else "Balansga qo‘shiladi"
+        lines.append(f"💰 {verb}: <b>{_tx_money(shown)} so‘m</b>")
+    else:
+        lines.append("💰 Summa: <b>yo‘q</b>")
+    if tx.get("kind") in {"add", "out"}:
+        lines.append(f"💳 Hozirgi balans: <b>{_tx_money(balance)} so‘m</b>")
+    lines.append(f"🖼 Ilova: <b>{_tx_media_label(tx)}</b>")
+    if tx.get("desc"):
+        lines += ["", f"📝 Izoh: {_esc(str(tx['desc']))}"]
+    lines += ["", "Foydalanuvchiga xabar yuboriladi."]
+    return "\n".join(lines)
+
+
+def _tx_confirm_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="txok"),
+         InlineKeyboardButton(text="❌ Bekor qilish", callback_data="txcancel")],
+    ])
+
+
+async def _tx_send_to_user(tx: dict, text: str) -> bool:
+    uid = int(tx["uid"])
+    media_type = str(tx.get("media_type") or "")
+    chat_id = tx.get("media_chat_id")
+    msg_id = tx.get("media_message_id")
+    kb = main_menu(uid)
+    if media_type and chat_id and msg_id:
+        if media_type != "sticker" and len(text) <= 1000:
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=msg_id,
+                                       caption=small_caps_html(text), reply_markup=kb)
+                return True
+            except Exception:
+                logging.exception("Qo'lda to'lov: media caption bilan yuborilmadi")
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            logging.exception("Qo'lda to'lov: ilova yuborilmadi")
+    await bot.send_message(uid, text, reply_markup=kb)
+    return True
+
+
 @dp.callback_query(F.data.startswith("uservip:"))
 async def user_vip_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
     uid=int(call.data.split(":",1)[1]); await state.update_data(manage_uid=uid); await state.set_state(Form.manage_vip_days)
-    await call.message.answer("VIP muddatini kunlarda yuboring (masalan, 30). 0 yuborsangiz cheksiz VIP beriladi:")
+    await call.message.answer("💎 VIP muddatini kunlarda yuboring (masalan, 30). 0 yuborsangiz cheksiz VIP beriladi:")
     await call.answer()
 
 @dp.message(Form.manage_vip_days)
 async def user_vip_save(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id): return await state.clear()
-    try: days=int((message.text or "").strip()); assert days >= 0
-    except Exception: return await message.answer("0 yoki musbat kun sonini yuboring:")
-    ctx=await state.get_data(); uid=int(ctx["manage_uid"]); data=load_data(); user=data.get("users",{}).get(str(uid))
-    if not user: await state.clear(); return await message.answer("Foydalanuvchi topilmadi.")
-    user["vip_until"] = 0 if days == 0 else now_ts()+days*86400
-    save_data(data); await state.clear(); await message.answer("✅ VIP yangilandi."); await show_user_management(message,uid)
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    try: days=int(text); assert days >= 0
+    except Exception: return await message.answer("💎 0 yoki musbat kun sonini yuboring:")
+    ctx=await state.get_data(); uid=int(ctx["manage_uid"])
+    if not load_data().get("users",{}).get(str(uid)):
+        await state.clear(); return await message.answer("❌ Foydalanuvchi topilmadi.")
+    await state.update_data(tx={"kind": "vip", "uid": uid, "days": days, "amount": 0, "desc": ""})
+    await state.set_state(Form.manage_vip_amount)
+    await message.answer(
+        "💰 VIP uchun to‘lov summasini so‘mda yuboring (masalan, 50000).\n"
+        "Summa foydalanuvchi balansiga ham qo‘shiladi.\n\n"
+        "Kerak bo‘lmasa: /skipp\nBekor qilish: /cancel")
+
+@dp.message(Form.manage_vip_amount)
+async def user_vip_amount_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    if text.lower() in {"/skipp", "/skip"}:
+        amount = 0.0
+    else:
+        try: amount=float(text.replace(" ", "").replace(",", ".")); assert amount >= 0
+        except Exception: return await message.answer("💰 Summani raqamda yuboring (masalan, 50000) yoki /skipp bosing:")
+    ctx=await state.get_data(); tx=ctx.get("tx") or {}
+    tx["amount"]=amount
+    await state.update_data(tx=tx)
+    await state.set_state(Form.manage_tx_desc)
+    await message.answer(
+        "📝 Izoh (tavsif) yozing — foydalanuvchi xabarida ko‘rinadi.\n\n"
+        "Kerak bo‘lmasa: /skipp\nBekor qilish: /cancel")
 
 @dp.callback_query(F.data.startswith("uservipremove:"))
 async def user_vip_remove(call: CallbackQuery):
     if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
     uid=int(call.data.split(":",1)[1]); data=load_data(); user=data.get("users",{}).get(str(uid),{})
-    user["vip_until"]=0; save_data(data); await call.answer("VIP bekor qilindi",show_alert=True); await show_user_management(call.message,uid)
+    await purge_vip_media(uid, user)
+    user["vip_until"]=0; save_data(data); await call.answer("❌ VIP bekor qilindi",show_alert=True); await show_user_management(call.message,uid)
 
 @dp.callback_query(F.data.startswith(("userbalance:","userbalanceout:")))
 async def user_balance_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
     mode,uid=call.data.split(":",1); await state.update_data(manage_uid=int(uid), balance_mode=mode); await state.set_state(Form.manage_balance_amount)
-    await call.message.answer("Summani so‘mda yuboring (faqat musbat son):"); await call.answer()
+    await call.message.answer("💰 Summani so‘mda yuboring (faqat musbat son):"); await call.answer()
 
 @dp.message(Form.manage_balance_amount)
 async def user_balance_save(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id): return await state.clear()
-    try: amount=float((message.text or "").strip().replace(",",".")); assert amount > 0
-    except Exception: return await message.answer("Musbat summa kiriting:")
-    ctx=await state.get_data(); uid=int(ctx["manage_uid"]); data=load_data(); user=data.get("users",{}).get(str(uid))
-    if not user: await state.clear(); return await message.answer("Foydalanuvchi topilmadi.")
-    old=float(user.get("balance",0) or 0); user["balance"] = old + amount if ctx["balance_mode"]=="userbalance" else max(0,old-amount)
-    save_data(data); await state.clear(); await message.answer("✅ Balans yangilandi."); await show_user_management(message,uid)
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    try: amount=float(text.replace(" ", "").replace(",",".")); assert amount > 0
+    except Exception: return await message.answer("💰 Musbat summa kiriting:")
+    ctx=await state.get_data(); uid=int(ctx["manage_uid"])
+    if not load_data().get("users",{}).get(str(uid)):
+        await state.clear(); return await message.answer("❌ Foydalanuvchi topilmadi.")
+    kind = "add" if ctx.get("balance_mode") == "userbalance" else "out"
+    await state.update_data(tx={"kind": kind, "uid": uid, "amount": amount, "desc": ""})
+    await state.set_state(Form.manage_tx_desc)
+    await message.answer(
+        "📝 Izoh (tavsif) yozing — foydalanuvchi xabarida ko‘rinadi.\n\n"
+        "Kerak bo‘lmasa: /skipp\nBekor qilish: /cancel")
+
+@dp.message(Form.manage_tx_desc)
+async def manage_tx_desc_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    has_media = bool(message.photo or message.video or message.document
+                     or message.sticker or message.animation)
+    if has_media:
+        return await message.answer("📝 Avval izohni yozing yoki /skipp bosing — ilovani keyingi qadamda yuborasiz.")
+    desc = "" if text.lower() in {"/skipp", "/skip"} else text[:900]
+    ctx=await state.get_data(); tx=ctx.get("tx") or {}
+    tx["desc"]=desc
+    await state.update_data(tx=tx)
+    await state.set_state(Form.manage_tx_media)
+    await message.answer(
+        "🖼 Rasm, video, fayl (txt) yoki stiker yuboring — u foydalanuvchiga shu xabar bilan boradi.\n\n"
+        "Kerak bo‘lmasa: /skipp\nBekor qilish: /cancel")
+
+@dp.message(Form.manage_tx_media)
+async def manage_tx_media_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    ctx=await state.get_data(); tx=ctx.get("tx") or {}
+    if text.lower() in {"/skipp", "/skip"}:
+        tx.pop("media_type", None); tx.pop("media_chat_id", None); tx.pop("media_message_id", None)
+    else:
+        media_type = ("photo" if message.photo else "video" if message.video
+                      else "sticker" if message.sticker else "document" if message.document
+                      else "animation" if message.animation else "")
+        if not media_type:
+            return await message.answer("🖼 Rasm, video, fayl yoki stiker yuboring. Kerak bo‘lmasa: /skipp")
+        tx["media_type"]=media_type
+        tx["media_chat_id"]=message.chat.id
+        tx["media_message_id"]=message.message_id
+    await state.update_data(tx=tx)
+    await state.set_state(Form.manage_tx_confirm)
+    await message.answer(_tx_confirm_text(tx), reply_markup=_tx_confirm_kb())
+
+@dp.message(Form.manage_tx_confirm)
+async def manage_tx_confirm_wait(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    if (message.text or "").strip() == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    await message.answer("🧾 Tasdiqlash uchun ✅ Tasdiqlash yoki ❌ Bekor qilish tugmasini bosing.")
+
+@dp.callback_query(F.data.in_({"txok", "txcancel"}))
+async def manage_tx_confirm(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    ctx = await state.get_data(); tx = ctx.get("tx")
+    if not tx or "uid" not in tx:
+        await state.clear()
+        return await call.answer("Bu amal allaqachon yakunlangan.", show_alert=True)
+    if call.data == "txcancel":
+        await state.clear()
+        try: await call.message.edit_text("❎ Amal bekor qilindi.")
+        except Exception: pass
+        return await call.answer("Bekor qilindi")
+    data = load_data(); user = data.get("users", {}).get(str(tx["uid"]))
+    if not user:
+        await state.clear()
+        return await call.answer("❌ Foydalanuvchi topilmadi", show_alert=True)
+    kind = tx.get("kind"); amount = float(tx.get("amount") or 0)
+    balance = float(user.get("balance", 0) or 0)
+    vip_until = 0; charged = amount
+    if kind == "add":
+        balance += amount
+    elif kind == "out":
+        charged = min(amount, balance)
+        balance = max(0, balance - amount)
+    elif kind == "vip":
+        days = int(tx.get("days") or 0)
+        vip_until = now_ts() + (days * 86400 if days > 0 else 100 * 365 * 86400)
+        user["vip_until"] = vip_until
+        user.pop("vip_warned_until", None)
+        balance += amount
+    user["balance"] = balance
+    tx["charged"] = charged
+    save_data(data)
+    delivered = True
+    try:
+        await _tx_send_to_user(tx, _tx_user_text(tx, balance, vip_until))
+    except Exception:
+        delivered = False
+        logging.exception("Qo'lda to'lov: foydalanuvchiga xabar yuborilmadi")
+    await state.clear()
+    tail = ("\n\n✅ Bajarildi, foydalanuvchiga xabar yuborildi." if delivered
+            else "\n\n⚠️ Bajarildi, lekin foydalanuvchiga xabar yetkazilmadi (botni bloklagan bo‘lishi mumkin).")
+    try: await call.message.edit_text(_tx_confirm_text(tx) + tail)
+    except Exception: pass
+    await call.answer("✅ Bajarildi." if delivered else "⚠️ Xabar yetkazilmadi", show_alert=not delivered)
+    await show_user_management(call.message, int(tx["uid"]))
 
 @dp.callback_query(F.data.startswith("usermute:"))
 async def user_mute_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
     uid=int(call.data.split(":",1)[1]); await state.update_data(manage_uid=uid); await state.set_state(Form.manage_mute_duration)
-    await call.message.answer("Mute muddatini daqiqalarda yuboring (masalan, 60 = 1 soat, 1440 = 1 kun):"); await call.answer()
+    await call.message.answer("🔇 Mute muddatini daqiqalarda yuboring (masalan, 60 = 1 soat, 1440 = 1 kun):"); await call.answer()
 
 @dp.message(Form.manage_mute_duration)
 async def user_mute_save(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id): return await state.clear()
     try: minutes=int((message.text or "").strip()); assert minutes > 0
-    except Exception: return await message.answer("Musbat daqiqa sonini yuboring:")
+    except Exception: return await message.answer("🔇 Musbat daqiqa sonini yuboring:")
     ctx=await state.get_data(); uid=int(ctx["manage_uid"]); data=load_data(); user=data.get("users",{}).get(str(uid))
-    if not user: await state.clear(); return await message.answer("Foydalanuvchi topilmadi.")
+    if not user: await state.clear(); return await message.answer("❌ Foydalanuvchi topilmadi.")
     user["mute_until"] = now_ts()+minutes*60; save_data(data); await state.clear(); await message.answer("✅ Mute muddati saqlandi."); await show_user_management(message,uid)
 
 @dp.callback_query(F.data.startswith("usermuteoff:"))
 async def user_mute_off(call: CallbackQuery):
     if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
     uid=int(call.data.split(":",1)[1]); data=load_data(); data.get("users",{}).setdefault(str(uid),{})["mute_until"]=0
-    save_data(data); await call.answer("Mute bekor qilindi",show_alert=True); await show_user_management(call.message,uid)
+    save_data(data); await call.answer("🔊 Mute bekor qilindi",show_alert=True); await show_user_management(call.message,uid)
 
 @dp.message(Command("backup"))
 async def backup_command(message: Message):
@@ -1269,6 +1959,19 @@ async def search_menu_open(call: CallbackQuery):
     await call.answer()
 
 
+@dp.callback_query(F.data.startswith("sm:"))
+async def search_kind_menu(call: CallbackQuery):
+    kind = call.data.split(":", 1)[1]
+    config = SEARCH_KINDS.get(kind)
+    if not config:
+        return await call.answer()
+    try:
+        await call.message.edit_text(config["title"], reply_markup=search_menu(call.from_user.id, kind))
+    except Exception:
+        await call.message.answer(config["title"], reply_markup=search_menu(call.from_user.id, kind))
+    await call.answer()
+
+
 @dp.callback_query(F.data == "guide")
 async def guide(call: CallbackQuery):
     text = (
@@ -1279,10 +1982,11 @@ async def guide(call: CallbackQuery):
         "4️⃣ Serial bo‘lsa, kerakli faslni, keyin qism raqamini bosing.\n"
         "5️⃣ Qism ochilgach, pastdagi ⬅️ va ➡️ tugmalari bilan oldingi yoki keyingi qismga o‘ting.\n\n"
         "🔒 Agar bot majburiy kanalga obuna bo‘lishni so‘rasa, kanallarga qo‘shiling va «Obunani tekshirish»ni bosing.\n"
+        "👥 Do‘stlaringizni taklif qiling: har 3 ta do‘st uchun 3 kunlik VIP olasiz — /ref buyrug‘i orqali havolangizni oling.\n"
         "💎 Saqlash himoyasi yoqilganida VIP bo‘lmaganlar yuborilgan videoni Telegram orqali saqlay yoki boshqa joyga uzata olmaydi. VIP foydalanuvchilarga bu cheklov qo‘yilmaydi."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔎 Kino qidirish", callback_data="search_menu")],
+        [InlineKeyboardButton(text="🍥 Anime qidirish", callback_data="sm:anime"), InlineKeyboardButton(text="🎞 Kino qidirish", callback_data="sm:kino")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]
     ])
     try:
@@ -1379,11 +2083,11 @@ async def catalog_show(call: CallbackQuery):
     key = call.data.split(":", 1)[1]
     item = data.get("channel_catalog", {}).get(key)
     if not item:
-        return await call.answer("Bu kino bazada topilmadi.", show_alert=True)
+        return await call.answer("❌ Bu kino bazada topilmadi.", show_alert=True)
     if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
-        return await call.answer("Botdan foydalanish taqiqlangan.", show_alert=True)
-    if not await check_subscription(call.from_user.id):
-        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling.", reply_markup=subscription_keyboard())
+        return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
+    if not await enforce_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     parts = item.get("parts", {})
     rows, row = [], []
@@ -1411,13 +2115,13 @@ async def catalog_send_part(call: CallbackQuery):
         part = item["parts"][number]
         tier = "regular"
         if part.get("tier") not in (None, "", tier):
-            return await call.answer("Bu qism noto'g'ri bazaga biriktirilgan.", show_alert=True)
+            return await call.answer("⚠️ Bu qism noto'g'ri bazaga biriktirilgan.", show_alert=True)
     except (KeyError, ValueError):
-        return await call.answer("Qism topilmadi.", show_alert=True)
+        return await call.answer("❌ Qism topilmadi.", show_alert=True)
     if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
-        return await call.answer("Botdan foydalanish taqiqlangan.", show_alert=True)
-    if not await check_subscription(call.from_user.id):
-        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling.", reply_markup=subscription_keyboard())
+        return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
+    if not await enforce_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     user = data.setdefault("users", {}).setdefault(str(call.from_user.id), {})
     matched_code = next((code for code, media in data.get("medias", {}).items() if normalize_media_title(media.get("name", "")) == normalize_media_title(item.get("name", ""))), None)
@@ -1425,19 +2129,33 @@ async def catalog_send_part(call: CallbackQuery):
     save_data(data)
     try:
         protect = should_protect_content(call.from_user.id, data)
-        await bot.copy_message(chat_id=call.from_user.id, from_chat_id=part["chat_id"], message_id=part["message_id"], protect_content=protect)
+        sent = await bot.copy_message(chat_id=call.from_user.id, from_chat_id=part["chat_id"], message_id=part["message_id"], protect_content=protect)
+        track_media_msg(call.from_user.id, getattr(sent, "message_id", None))
         await call.answer(f"{number}-qism yuborildi")
     except Exception:
         logging.exception("Catalog part copy failed")
-        await call.answer("Qism yuborilmadi. Botning kanal adminligi va postni tekshiring.", show_alert=True)
+        await call.answer("❌ Qism yuborilmadi. Botning kanal adminligi va postni tekshiring.", show_alert=True)
+
+
+async def _start_name_search(call: CallbackQuery, state: FSMContext, media_filter: str):
+    await state.update_data(search_filter=media_filter)
+    await state.set_state(Form.search_name)
+    prompt = SEARCH_KINDS.get(media_filter, {}).get(
+        "name_prompt",
+        "🔤 Qidirilayotgan kino yoki serial nomini yozing. Har safar yuborganingizda mos nomlar tanlash uchun chiqadi:",
+    )
+    await call.message.answer(prompt)
+    await call.answer()
 
 
 @dp.callback_query(F.data == "search_name")
 async def search_name_start(call: CallbackQuery, state: FSMContext):
-    await state.update_data(search_filter="all")
-    await state.set_state(Form.search_name)
-    await call.message.answer("🔤 Qidirilayotgan kino yoki serial nomini yozing. Har safar yuborganingizda mos nomlar tanlash uchun chiqadi:")
-    await call.answer()
+    await _start_name_search(call, state, "all")
+
+
+@dp.callback_query(F.data.startswith("search_name:"))
+async def search_name_start_scoped(call: CallbackQuery, state: FSMContext):
+    await _start_name_search(call, state, call.data.split(":", 1)[1])
 
 
 @dp.callback_query(F.data.startswith("category:"))
@@ -1456,46 +2174,71 @@ async def search_name_result(message: Message, state: FSMContext):
         return
     query = (message.text or "").strip().casefold()
     if not query:
-        return await message.answer("Nomdan kamida bir necha harf yozing:")
+        return await message.answer("✍️ Nomdan kamida bir necha harf yozing:")
     saved = await state.get_data()
     media_filter = saved.get("search_filter", "all")
     data = load_data()
-    matches = [(str(code), item) for code, item in data.get("medias", {}).items()
-               if item.get("media_type", "series") in {"movie", "series", "drama", "anime", "cartoon"}
-               and query in item.get("name", "").casefold()
-               and (media_filter == "all" or item.get("media_type", "series") == media_filter)
-               and media_available_for_user(message.from_user.id, item, data)]
-    # Prefix matches first, then substring matches, so results are easier to select.
-    matches.sort(key=lambda pair: (not pair[1].get("name", "").casefold().startswith(query), pair[1].get("name", "").casefold()))
+    candidates = [(str(code), item) for code, item in data.get("medias", {}).items()
+                  if item.get("media_type", "series") in {"movie", "series", "drama", "anime", "cartoon"}
+                  and search_filter_matches(item.get("media_type", "series"), media_filter)
+                  and media_available_for_user(message.from_user.id, item, data)]
+    # Avval aniq qism/substring, keyin imlo xatosiga o'xshash nomlar.
+    matches = []
+    normalized_query = re.sub(r"[^a-z0-9а-яё]", "", query)
+    for code, item in candidates:
+        name = str(item.get("name", ""))
+        folded = name.casefold()
+        normalized_name = re.sub(r"[^a-z0-9а-яё]", "", folded)
+        ratio = difflib.SequenceMatcher(None, normalized_query, normalized_name).ratio()
+        token_scores = [difflib.SequenceMatcher(None, normalized_query, token).ratio() for token in re.findall(r"[a-z0-9а-яё]+", folded)]
+        score = max([ratio] + token_scores)
+        if query in folded or (len(normalized_query) >= 3 and score >= (0.48 if len(normalized_query) <= 5 else 0.42)):
+            matches.append((code, item, score))
+    matches.sort(key=lambda pair: (query not in pair[1].get("name", "").casefold(), -pair[2], pair[1].get("name", "").casefold()))
     if not matches:
-        return await message.answer("❌ Mos nom topilmadi. Boshqa nom yoki qismini yozib ko'ring:", reply_markup=search_menu(message.from_user.id))
+        empty = SEARCH_KINDS.get(media_filter, {}).get("empty", "❌ Mos nom topilmadi. Boshqa nom yoki qismini yozib ko'ring:")
+        return await message.answer(empty, reply_markup=search_menu(message.from_user.id, media_filter if media_filter in SEARCH_KINDS else None))
     rows = []
-    for code, item in matches[:40]:
+    for code, item, _score in matches[:40]:
         icon = {"movie":"🎞", "series":"📺", "drama":"🎭", "anime":"🍥", "cartoon":"🎨"}.get(item.get("media_type"), "🎬")
         rows.append([InlineKeyboardButton(text=f"{icon} {item.get('name','Nomsiz')} · {code}", callback_data=f"show:{code}")])
-    rows.append([InlineKeyboardButton(text="🔎 Yana qidirish", callback_data="search_name")])
-    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
+    rows.append([InlineKeyboardButton(text="🔎 Yana qidirish", callback_data=(f"search_name:{media_filter}" if media_filter in SEARCH_KINDS else "search_name"))])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=search_back_target(media_filter))])
     await message.answer(f"🔎 <b>Topilgan nomlar: {len(matches)}</b>\nKeraklisini tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await state.clear()
 
 
 @dp.callback_query(F.data == "search")
 async def search_start(call: CallbackQuery, state: FSMContext):
+    await state.update_data(search_filter="all")
     await state.set_state(Form.search_code)
     await call.message.answer("🔢 Kino yoki serial kodini yuboring:")
     await call.answer()
 
 
+@dp.callback_query(F.data.startswith("search:"))
+async def search_start_scoped(call: CallbackQuery, state: FSMContext):
+    kind = call.data.split(":", 1)[1]
+    config = SEARCH_KINDS.get(kind)
+    await state.update_data(search_filter=kind if config else "all")
+    await state.set_state(Form.search_code)
+    await call.message.answer(config["code_prompt"] if config else "🔢 Kino yoki serial kodini yuboring:")
+    await call.answer()
+
+
 @dp.message(Form.search_code)
 async def search_code(message: Message, state: FSMContext):
+    saved = await state.get_data()
+    media_filter = saved.get("search_filter", "all")
     await state.clear()
     if not await require_subscription_message(message):
         return
     data = load_data()
     code = message.text.strip() if message.text else ""
     media = data["medias"].get(code)
-    if not media:
-        return await message.answer("❌ Bu kod bo‘yicha kino yoki serial topilmadi.")
+    if not media or not search_filter_matches(media.get("media_type", "series"), media_filter):
+        empty = SEARCH_KINDS.get(media_filter, {}).get("empty", "❌ Bu kod bo‘yicha kino yoki serial topilmadi.")
+        return await message.answer(empty, reply_markup=search_menu(message.chat.id, media_filter if media_filter in SEARCH_KINDS else None))
     await send_media_card(message.chat.id, code, media)
 
 
@@ -1513,7 +2256,7 @@ async def season_page(call: CallbackQuery):
         markup = episode_keyboard(code, episodes, user_id=call.from_user.id, season=season_no, media=media, page=int(page))
         await call.message.edit_reply_markup(reply_markup=markup)
     except Exception:
-        await call.answer("Sahifani ochib bo‘lmadi.", show_alert=True)
+        await call.answer("⚠️ Sahifani ochib bo‘lmadi.", show_alert=True)
     else:
         await call.answer()
 
@@ -1529,7 +2272,7 @@ async def season_show(call: CallbackQuery):
         await call.message.answer(title, reply_markup=kb)
         await call.answer()
     except (KeyError, ValueError):
-        await call.answer("Fasl topilmadi.", show_alert=True)
+        await call.answer("❌ Fasl topilmadi.", show_alert=True)
 
 
 def episode_navigation_keyboard(code, season_no, current_no, available_numbers):
@@ -1549,10 +2292,10 @@ def episode_navigation_keyboard(code, season_no, current_no, available_numbers):
 async def send_episode(call: CallbackQuery):
     data = load_data()
     if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
-        return await call.answer("Botdan foydalanish taqiqlangan.", show_alert=True)
-    if not await check_subscription(call.from_user.id):
+        return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
+    if not await enforce_subscription(call.from_user.id):
         await call.message.answer(
-            "🔒 Avval kanallarga obuna bo'ling.", reply_markup=subscription_keyboard()
+            "🔒 Avval kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard()
         )
         return await call.answer()
     try:
@@ -1567,7 +2310,7 @@ async def send_episode(call: CallbackQuery):
         season_data = (media.get("seasons") or {}).get(season_number, {"episodes": media.get("episodes", {})})
         episode_record = season_data.get("episodes", {}).get(number) or media.get("episodes", {}).get(number)
         if not episode_record:
-            await call.answer("Bu qism hali joylanmagan.", show_alert=True)
+            await call.answer("⏳ Bu qism hali joylanmagan.", show_alert=True)
             return
         tier = "regular"
         if isinstance(episode_record, dict) and "regular" in episode_record:
@@ -1581,7 +2324,7 @@ async def send_episode(call: CallbackQuery):
         else:
             episode = None
         if not episode or not isinstance(episode, dict):
-            await call.answer("Bu qism hali qo'shilmagan.", show_alert=True)
+            await call.answer("⏳ Bu qism hali qo'shilmagan.", show_alert=True)
             return
         user = current_data.setdefault("users", {}).setdefault(str(call.from_user.id), {})
         user["last_watched"] = {"code": code, "season": season_number, "number": number, "media_type": media.get("media_type", "series"), "updated_at": now_ts()}
@@ -1617,13 +2360,15 @@ async def send_episode(call: CallbackQuery):
                 send_kwargs["cover"] = episode["cover_id"]
             if media_type == "video" and episode.get("start_timestamp") is not None:
                 send_kwargs["start_timestamp"] = episode["start_timestamp"]
-            await send_method(**send_kwargs)
+            sent = await send_method(**send_kwargs)
+            track_media_msg(call.from_user.id, getattr(sent, "message_id", None))
         elif "chat_id" in episode and "message_id" in episode:
-            await bot.copy_message(chat_id=call.from_user.id, from_chat_id=episode["chat_id"], message_id=episode["message_id"], protect_content=protect, reply_markup=nav_markup)
+            sent = await bot.copy_message(chat_id=call.from_user.id, from_chat_id=episode["chat_id"], message_id=episode["message_id"], protect_content=protect, reply_markup=nav_markup)
+            track_media_msg(call.from_user.id, getattr(sent, "message_id", None))
         else:
-            await call.answer("Qism ma'lumoti noto'g'ri saqlangan.", show_alert=True)
+            await call.answer("⚠️ Qism ma'lumoti noto'g'ri saqlangan.", show_alert=True)
             return
-        await call.answer("Qism yuborildi")
+        await call.answer("✅ Qism yuborildi")
     except Exception:
         await call.answer("❌ Qism yuborilmadi. Kanal va xabarni tekshiring.", show_alert=True)
 
@@ -1633,18 +2378,18 @@ async def category_list_callback(call: CallbackQuery):
     media_type = call.data.split(":", 1)[1]
     labels = {"movie":("🎞 Kinolar", "📭 Kino hali qo'shilmagan"), "series":("📺 Seriallar", "📭 Serial hali qo'shilmagan"), "drama":("🎭 Dramalar", "📭 Drama hali qo'shilmagan"), "anime":("🍥 Anime", "📭 Anime hali qo'shilmagan"), "cartoon":("🎨 Multfilmlar", "📭 Multfilm hali qo'shilmagan")}
     title, empty = labels.get(media_type, ("🎬 Kontent", "📭 Hozircha bo'sh"))
-    await media_category_list(call, media_type, title, empty)
+    await media_category_list(call, media_type, title, empty, back=f"sm:{media_kind(media_type)}")
 
 
 @dp.callback_query(F.data == "movie_list")
 async def movie_list(call: CallbackQuery):
     data = load_data()
-    if not await check_subscription(call.from_user.id):
-        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo‘ling.", reply_markup=subscription_keyboard())
+    if not await enforce_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo‘ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     items = [(code, item) for code, item in data.get("medias", {}).items() if item.get("media_type") == "movie" and media_available_for_user(call.from_user.id, item, data)]
     rows = [[InlineKeyboardButton(text=f"🎞 {item['name']} · {code}", callback_data=f"show:{code}")] for code, item in items[:80]]
-    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="sm:kino")])
     await call.message.answer("🎞 <b>Kinolar ro‘yxati</b>" if items else "📭 Hozircha kino qo‘shilmagan.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
 
@@ -1654,10 +2399,10 @@ async def series_list(call: CallbackQuery):
     await media_category_list(call, "series", "📺 Seriallar ro‘yxati", "📭 Hozircha serial qo‘shilmagan.")
 
 
-async def media_category_list(call: CallbackQuery, media_type: str, title: str, empty_text: str, page: int = 0):
+async def media_category_list(call: CallbackQuery, media_type: str, title: str, empty_text: str, page: int = 0, back: str = "search_menu"):
     data = load_data()
-    if not await check_subscription(call.from_user.id):
-        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo‘ling.", reply_markup=subscription_keyboard())
+    if not await enforce_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo‘ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     items = [(str(code), item) for code, item in data.get("medias", {}).items()
              if item.get("media_type", "series") == media_type
@@ -1674,7 +2419,7 @@ async def media_category_list(call: CallbackQuery, media_type: str, title: str, 
         middle_btn = InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="page_info")
         right_btn = InlineKeyboardButton(text="➡️", callback_data=f"media_page:{media_type}:{page+1}") if page < total_pages - 1 else None
         rows.extend(build_pager_row(left_btn, middle_btn, right_btn))
-    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=back)])
     text = f"<b>{title}</b>\n\nJami: {len(items)} ta" if items else empty_text
     try:
         await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -1694,7 +2439,7 @@ async def media_page_callback(call: CallbackQuery):
               "cartoon":("🎨 Multiklar ro'yxati", "📭 Hozircha multik qo'shilmagan."),
               "series":("📺 Seriallar ro'yxati", "📭 Hozircha serial qo'shilmagan.")}
     title, empty = labels.get(media_type, ("🎬 Kontent ro'yxati", "📭 Hozircha bo'sh."))
-    await media_category_list(call, media_type, title, empty, int(page))
+    await media_category_list(call, media_type, title, empty, int(page), back=f"sm:{media_kind(media_type)}")
 
 
 @dp.callback_query(F.data.startswith("favorite_add:"))
@@ -1702,7 +2447,7 @@ async def favorite_add(call: CallbackQuery):
     data = load_data()
     code = call.data.split(":", 1)[1]
     if code not in data.get("medias", {}):
-        return await call.answer("Topilmadi", show_alert=True)
+        return await call.answer("❌ Topilmadi", show_alert=True)
     user = data.setdefault("users", {}).setdefault(str(call.from_user.id), {"id": call.from_user.id, "favorites": []})
     favs = user.setdefault("favorites", [])
     if code in favs:
@@ -1740,16 +2485,16 @@ async def continue_watching(call: CallbackQuery):
     item = data.get("medias", {}).get(code)
     if item:
         await send_media_card(call.from_user.id, code, item)
-        await call.answer("Davom ettirish uchun kerakli qismni bosing")
+        await call.answer("▶️ Davom ettirish uchun kerakli qismni bosing")
     elif last.get("catalog_key") in data.get("channel_catalog", {}):
         key = last["catalog_key"]
         catalog_item = data["channel_catalog"][key]
         parts = catalog_item.get("parts", {})
         rows = [[InlineKeyboardButton(text=f"▶️ {number}-qism", callback_data=f"catalog_part:{key}:{number}")] for number in sorted(parts, key=lambda value: int(value) if str(value).isdigit() else 999999)]
         await call.message.answer(f"🎬 <b>{catalog_item.get('name', 'Nomsiz')}</b>\n\n{catalog_item.get('description', '')}", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-        await call.answer("Oxirgi ko‘rilgan kino topildi")
+        await call.answer("✅ Oxirgi ko‘rilgan kino topildi")
     else:
-        await call.answer("Hali tomosha qilgan narsangiz yo‘q.", show_alert=True)
+        await call.answer("ℹ️ Hali tomosha qilgan narsangiz yo‘q.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("show:"))
@@ -1757,11 +2502,11 @@ async def show_media(call: CallbackQuery):
     code = call.data.split(":", 1)[1]
     data = load_data()
     if code not in data["medias"]:
-        return await call.answer("Kontent topilmadi", show_alert=True)
+        return await call.answer("❌ Kontent topilmadi", show_alert=True)
     if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
-        return await call.answer("Botdan foydalanish taqiqlangan.", show_alert=True)
-    if not await check_subscription(call.from_user.id):
-        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling.", reply_markup=subscription_keyboard())
+        return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
+    if not await enforce_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     try:
         await call.message.edit_text("🎬 <b>Kontent ochildi.</b>")
@@ -1792,7 +2537,7 @@ async def admin_add_content_callback(call: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🎞 Kino", callback_data="newtype:movie"), InlineKeyboardButton(text="🍥 Anime", callback_data="newtype:anime")],
         [InlineKeyboardButton(text="🎨 Multfilm", callback_data="newtype:cartoon")],
     ])
-    await call.message.answer("Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
+    await call.message.answer("🎬 Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
     await call.answer()
 
 
@@ -1804,7 +2549,7 @@ async def add_movie(call: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🎞 Kino", callback_data="newtype:movie"), InlineKeyboardButton(text="🍥 Anime", callback_data="newtype:anime")],
         [InlineKeyboardButton(text="🎨 Multfilm", callback_data="newtype:cartoon")],
     ])
-    await call.message.answer("Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
+    await call.message.answer("🎬 Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
     await call.answer()
 
 
@@ -1816,7 +2561,7 @@ async def add_series(call: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="📺 Serial", callback_data="newtype:series")],
         [InlineKeyboardButton(text="🍥 Anime", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm", callback_data="newtype:cartoon")],
     ])
-    await call.message.answer("Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
+    await call.message.answer("🎬 Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
     await call.answer()
 
 
@@ -1853,7 +2598,7 @@ async def media_name(message: Message, state: FSMContext):
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     name = (message.text or "").strip()
     if not name:
-        return await message.answer("Kontent nomini matn ko'rinishida yuboring:")
+        return await message.answer("✍️ Kontent nomini matn ko'rinishida yuboring:")
     await state.update_data(new_name=name)
     await state.set_state(Form.media_info)
     await message.answer(
@@ -1899,7 +2644,7 @@ async def media_info(message: Message, state: FSMContext):
     elif message.text:
         description = message.text.strip()
     else:
-        return await message.answer("Rasm yoki matn yuboring, yoki /skip bosing.")
+        return await message.answer("🖼 Rasm yoki matn yuboring, yoki /skip bosing.")
     await state.update_data(pending_poster=poster, pending_description=description, pending_forward_record=forwarded_record)
     await state.set_state(Form.media_details)
     await message.answer(
@@ -1971,16 +2716,16 @@ async def media_season_count_save(message: Message, state: FSMContext):
     try:
         count = int((message.text or "").strip())
     except ValueError:
-        return await message.answer("Fasllar sonini raqam bilan yuboring, masalan 1 yoki 3:")
+        return await message.answer("🔢 Fasllar sonini raqam bilan yuboring, masalan 1 yoki 3:")
     if count < 1 or count > 30:
-        return await message.answer("Fasllar soni 1 dan 30 gacha bo‘lishi kerak:")
+        return await message.answer("⚠️ Fasllar soni 1 dan 30 gacha bo‘lishi kerak:")
     saved = await state.get_data()
     code = str(saved.get("new_code"))
     data = load_data()
     item = data.get("medias", {}).get(code)
     if not item:
         await state.clear()
-        return await message.answer("Kontent topilmadi. Qaytadan qo‘shing.", reply_markup=admin_menu(message.from_user.id))
+        return await message.answer("❌ Kontent topilmadi. Qaytadan qo‘shing.", reply_markup=admin_menu(message.from_user.id))
     existing_eps = item.get("seasons", {}).get("1", {}).get("episodes", {})
     item["seasons"] = {str(n): {"episodes": {}} for n in range(1, count + 1)}
     if existing_eps:
@@ -1999,7 +2744,7 @@ async def media_season_count_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "add_episode")
 async def add_episode(call: CallbackQuery, state: FSMContext):
-    await ask(call, state, Form.episode_code, "Qismlar qo‘shiladigan kino yoki serial kodini yuboring:")
+    await ask(call, state, Form.episode_code, "🔢 Qismlar qo‘shiladigan kino yoki serial kodini yuboring:")
 
 
 @dp.message(Form.episode_code)
@@ -2028,7 +2773,7 @@ async def episode_season_select(message: Message, state: FSMContext):
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     raw = (message.text or "").strip()
     if not raw.isdigit() or not 1 <= int(raw) <= 100:
-        return await message.answer("Fasl raqamini 1 dan 100 gacha raqam bilan yuboring, masalan 2:")
+        return await message.answer("🔢 Fasl raqamini 1 dan 100 gacha raqam bilan yuboring, masalan 2:")
     season_no = str(int(raw))
     saved = await state.get_data()
     code = str(saved.get("batch_code", ""))
@@ -2036,15 +2781,108 @@ async def episode_season_select(message: Message, state: FSMContext):
     item = data.get("medias", {}).get(code)
     if not item:
         await state.clear()
-        return await message.answer("Kontent topilmadi. Qaytadan boshlang.", reply_markup=admin_menu(message.from_user.id))
+        return await message.answer("❌ Kontent topilmadi. Qaytadan boshlang.", reply_markup=admin_menu(message.from_user.id))
     item.setdefault("seasons", {}).setdefault(season_no, {"episodes": {}})
     save_data(data)
     await state.update_data(batch_season=season_no, batch_count=0)
     await state.set_state(Form.episode_batch)
     prompt = await message.answer(
-        f"🎬 <b>{item['name']}</b> · <b>{season_no}-fasl</b>\nQismlarni bittadan yuboring. Birinchi media 1-qism, ikkinchisi 2-qism bo‘ladi.\n/done — tugatish · /cancel — bekor qilish"
+        f"🎬 <b>{item['name']}</b> · <b>{season_no}-fasl</b>\nQismlarni bittadan yoki bir nechtasini ketma-ket yuboring. Bot tavsifdagi 1-qism, Qism: 2 va shunga o'xshash raqamlarni taniydi; raqam topilmasa navbatdagi bo'sh raqamni beradi.\n/done — tugatish · /cancel — bekor qilish"
     )
     await state.update_data(progress_message_id=prompt.message_id)
+
+
+_EP_KEYWORDS = (
+    r"qism|qismi|episode|epizod|seriya|seria|part|серия|часть",
+    r"bolum|bolumu|bolim|bolimi|chapter",
+)
+_NUM_WORDS = {
+    "nol": 0, "bir": 1, "ikki": 2, "uch": 3, "tort": 4, "besh": 5, "olti": 6,
+    "yetti": 7, "sakkiz": 8, "toqqiz": 9, "on": 10, "yigirma": 20, "ottiz": 30,
+    "qirq": 40, "ellik": 50, "oltmish": 60, "yetmish": 70, "sakson": 80,
+    "toqson": 90, "yuz": 100,
+    # turkcha
+    "iki": 2, "uc": 3, "dort": 4, "bes": 5, "alti": 6, "yedi": 7, "dokuz": 9,
+    "yirmi": 20, "otuz": 30, "kirk": 40, "elli": 50, "altmis": 60,
+    "yetmis": 70, "seksen": 80, "doksan": 90,
+}
+_ORD_WORDS = {
+    "birinchi": 1, "ikkinchi": 2, "uchinchi": 3, "tortinchi": 4, "beshinchi": 5,
+    "oltinchi": 6, "yettinchi": 7, "sakkizinchi": 8, "toqqizinchi": 9,
+    "oninchi": 10, "yigirmanchi": 20, "ottizinchi": 30, "qirqinchi": 40,
+    "elliginchi": 50, "oltmishinchi": 60, "yetmishinchi": 70,
+    "saksoninchi": 80, "toqsoninchi": 90, "yuzinchi": 100,
+    "birinci": 1, "ikinci": 2, "ucuncu": 3, "dorduncu": 4, "besinci": 5,
+    "altinci": 6, "yedinci": 7, "sekizinci": 8, "dokuzuncu": 9, "onuncu": 10,
+}
+_TRANS = {
+    ord("ö"): "o", ord("ü"): "u", ord("ş"): "s", ord("ç"): "c", ord("ğ"): "g",
+    ord("ı"): "i", ord("ə"): "e", ord("’"): "", ord("‘"): "", ord("`"): "",
+    ord("'"): "", ord("ʻ"): "", ord("ʼ"): "",
+    ord(chr(0x307)): "", ord("–"): "-", ord("—"): "-", ord("−"): "-", ord("‐"): "-", ord("‑"): "-",
+}
+for _digits in ("٠١٢٣٤٥٦٧٨٩", "۰۱۲۳۴۵۶۷۸۹"):
+    for _idx, _ch in enumerate(_digits):
+        _TRANS[ord(_ch)] = str(_idx)
+
+
+def _norm_caption(value):
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(text.casefold().translate(_TRANS).split())
+
+
+def _num_words_sum(tokens):
+    total, found = 0, False
+    for token in tokens:
+        value = _NUM_WORDS.get(token, _ORD_WORDS.get(token))
+        if value is None:
+            return None
+        found = True
+        if value == 100:
+            total = (total or 1) * 100
+        else:
+            total += value
+    return total if found else None
+
+
+def _words_phrase_number(phrase):
+    tokens = [t for t in phrase.split() if t]
+    for start in range(len(tokens)):
+        value = _num_words_sum(tokens[start:])
+        if value:
+            return value
+    return None
+
+
+def _detect_part_number(text):
+    """Qism raqamini turli yozuvlarda topadi: '5-qism', '5. BÖLÜM', 'Qism: 5', 'beshinchi qism'."""
+    norm = _norm_caption(text)
+    if not norm:
+        return None
+    for keywords in _EP_KEYWORDS:
+        for pattern in (r"(\d{1,4})\s*[.\-–—_:#№)\]]*\s*(?:%s)" % keywords,
+                        r"(?:%s)\s*[.\-–—_:#№]*\s*(\d{1,4})" % keywords):
+            m = re.search(pattern, norm)
+            if m and int(m.group(1)) > 0:
+                return int(m.group(1))
+        for pattern in (r"([a-z]+(?:\s+[a-z]+){0,3})\s*(?:%s)" % keywords,
+                        r"(?:%s)\s*([a-z]+(?:\s+[a-z]+){0,3})" % keywords):
+            m = re.search(pattern, norm)
+            if m:
+                value = _words_phrase_number(m.group(1))
+                if value:
+                    return value
+    m = re.search(r"\bs\s*(\d{1,2})\s*[._ -]?\s*e\s*(\d{1,4})\b", norm)
+    if m:
+        return int(m.group(2))
+    m = re.search(r"\b(\d{1,2})\s*[xх]\s*(\d{1,4})\b", norm)
+    if m:
+        return int(m.group(2))
+    cleaned = re.sub(r"\d+\s*[.\-]?\s*(?:fasl|mavsum|season|sezon|saison|сезон)", " ", norm)
+    cleaned = re.sub(r"\b(?:19|20)\d{2}\b", " ", cleaned)
+    cleaned = re.sub(r"\b\d{3,4}\s*p\b", " ", cleaned)
+    m = re.search(r"\b(\d{1,3})\b", cleaned)
+    return int(m.group(1)) if m and int(m.group(1)) > 0 else None
 
 
 @dp.message(Form.episode_batch)
@@ -2107,7 +2945,18 @@ async def episode_batch_message(message: Message, state: FSMContext):
     season = item.setdefault("seasons", {}).setdefault(season_no, {"episodes": {}})
     episodes = season.setdefault("episodes", {})
     numeric = [int(n) for n in episodes if str(n).isdigit()]
-    number = max(numeric, default=0) + 1
+    next_number = max(numeric, default=0) + 1
+    caption_text = " ".join(filter(None, [message.caption or "", message.text or ""]))
+    detected_number = _detect_part_number(caption_text)
+    number = detected_number if detected_number and detected_number > 0 else next_number
+    note = ""
+    if str(number) in episodes:
+        existing_record = episodes.get(str(number)) or {}
+        if file_id and existing_record.get("file_id") == file_id:
+            return await message.answer(f"⚠️ Bu media allaqachon {number}-qism sifatida saqlangan.")
+        taken = number
+        number = next_number
+        note = f"\nℹ️ {taken}-qism band edi — {number}-qism sifatida saqlandi."
     if origin_chat and origin_message_id:
         # Asl postni nusxalash media xabari va mavjud coverni saqlash uchun afzal.
         record = {"chat_id": origin_chat.id, "message_id": origin_message_id, "media_type": media_type or "video"}
@@ -2132,18 +2981,18 @@ async def episode_batch_message(message: Message, state: FSMContext):
     if progress_id:
         try:
             await bot.edit_message_text(chat_id=message.chat.id, message_id=progress_id,
-                text=f"🎬 <b>{item['name']}</b> · {season_no}-fasl\n✅ {count} ta qism saqlandi. Oxirgisi: <b>{number}-qism</b>.\n\nKanal postlarini forward qilishda davom eting.\nTugatish: /done · Bekor qilish: /cancel")
+                text=f"🎬 <b>{item['name']}</b> · {season_no}-fasl\n✅ {count} ta media qabul qilindi. Oxirgisi: <b>{number}-qism</b>.{note}\n\nPostlarni yuborishda davom eting.\nTugatish: /done · Bekor qilish: /cancel")
         except Exception:
-            await message.answer(f"✅ {number}-qism saqlandi. Keyingi postni forward qiling yoki /done yozing.")
+            await message.answer(f"✅ {number}-qism saqlandi.{note}\nKeyingi postni forward qiling yoki /done yozing.")
     else:
-        await message.answer(f"✅ {number}-qism saqlandi. Keyingi postni forward qiling yoki /done yozing.")
+        await message.answer(f"✅ {number}-qism saqlandi.{note}\nKeyingi postni forward qiling yoki /done yozing.")
 
 @dp.callback_query(F.data == "edit_poster")
 async def edit_poster_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id) and not has_permission(call.from_user.id, "edit_content"):
         return await call.answer("⛔ Sizda tahrirlash huquqi yo'q.", show_alert=True)
     await state.set_state(Form.edit_poster_code)
-    await call.message.answer("Posterini almashtirmoqchi bo'lgan kontent kodini yuboring:")
+    await call.message.answer("🖼 Posterini almashtirmoqchi bo'lgan kontent kodini yuboring:")
     await call.answer()
 
 
@@ -2156,7 +3005,7 @@ async def edit_poster_code_save(message: Message, state: FSMContext):
         return await message.answer("Kod topilmadi. Qayta yuboring:")
     await state.update_data(edit_poster_code=code)
     await state.set_state(Form.edit_poster_file)
-    await message.answer("Yangi poster rasmini yuboring. Posterni olib tashlash uchun /remove yozing:")
+    await message.answer("🖼 Yangi poster rasmini yuboring. Posterni olib tashlash uchun /remove yozing:")
 
 
 @dp.message(Form.edit_poster_file)
@@ -2166,13 +3015,13 @@ async def edit_poster_file_save(message: Message, state: FSMContext):
     saved = await state.get_data(); code = str(saved.get("edit_poster_code", ""))
     data = load_data(); item = data.get("medias", {}).get(code)
     if not item:
-        await state.clear(); return await message.answer("Kontent topilmadi.")
+        await state.clear(); return await message.answer("❌ Kontent topilmadi.")
     if message.photo:
         item["poster_file_id"] = message.photo[-1].file_id
     elif (message.text or "").strip() == "/remove":
         item["poster_file_id"] = None
     else:
-        return await message.answer("Rasm yuboring yoki /remove yozing:")
+        return await message.answer("🖼 Rasm yuboring yoki /remove yozing:")
     save_data(data); await state.clear()
     await message.answer(f"✅ <b>{item.get('name')}</b> posteri yangilandi.", reply_markup=admin_menu(message.from_user.id))
 
@@ -2182,19 +3031,19 @@ async def admin_permissions_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await call.answer("Faqat owner uchun.", show_alert=True)
     await state.set_state(Form.admin_permissions_id)
-    await call.message.answer("Huquqlarini o'zgartirmoqchi bo'lgan admin Telegram ID sini yuboring:")
+    await call.message.answer("🔐 Huquqlarini o'zgartirmoqchi bo'lgan admin Telegram ID sini yuboring:")
     await call.answer()
 
 
 @dp.message(Form.admin_permissions_id)
 async def admin_permissions_choose(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
-        await state.clear(); return await message.answer("Faqat owner uchun.")
+        await state.clear(); return await message.answer("⛔ Faqat owner uchun.")
     try: uid = int((message.text or "").strip())
-    except ValueError: return await message.answer("Telegram ID raqamini yuboring:")
+    except ValueError: return await message.answer("🆔 Telegram ID raqamini yuboring:")
     data = load_data()
     if uid not in data.get("admins", []) and uid not in ADMIN_IDS:
-        return await message.answer("Bu ID adminlar ro'yxatida yo'q. Avval admin qo'shing:")
+        return await message.answer("⚠️ Bu ID adminlar ro'yxatida yo'q. Avval admin qo'shing:")
     perms = set(get_admin_permissions(uid))
     labels = [("add_content", "Kontent qo'shish"), ("add_episode", "Qism/sezon qo'shish"), ("edit_content", "Nom/poster tahrirlash"), ("delete_content", "Kontent o'chirish")]
     rows = [[InlineKeyboardButton(text=("✅ " if key in perms else "⬜ ")+label, callback_data=f"perm_toggle:{uid}:{key}")] for key,label in labels]
@@ -2217,14 +3066,14 @@ async def admin_permission_toggle(call: CallbackQuery):
     rows = [[InlineKeyboardButton(text=("✅ " if key in permissions else "⬜ ")+label, callback_data=f"perm_toggle:{uid}:{key}")] for key,label in labels]
     rows.append([InlineKeyboardButton(text="✅ Tayyor", callback_data="admin_home")])
     await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await call.answer("Huquq yangilandi")
+    await call.answer("✅ Huquq yangilandi")
 
 
 @dp.callback_query(F.data == "del_media")
 async def del_media(call: CallbackQuery, state: FSMContext):
     if not has_permission(call.from_user.id, "delete_content"):
         return await call.answer("⛔ Sizda o'chirish huquqi yo'q.", show_alert=True)
-    await ask(call, state, Form.delete_code, "O'chiriladigan kino yoki serial kodini yuboring:")
+    await ask(call, state, Form.delete_code, "🗑 O'chiriladigan kino yoki serial kodini yuboring:")
 
 
 @dp.message(Form.delete_code)
@@ -2245,7 +3094,7 @@ async def delete_media(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "del_episode")
 async def del_episode(call: CallbackQuery, state: FSMContext):
-    await ask(call, state, Form.delete_episode_code, "Qismi o'chiriladigan media kodini yuboring:")
+    await ask(call, state, Form.delete_episode_code, "🗑 Qismi o'chiriladigan media kodini yuboring:")
 
 
 @dp.message(Form.delete_episode_code)
@@ -2259,7 +3108,7 @@ async def delete_episode_ask_number(message: Message, state: FSMContext):
         return await message.answer("❌ media kodi topilmadi. Qayta yuboring:")
     await state.update_data(delete_episode_code=code)
     await state.set_state(Form.delete_episode_number)
-    await message.answer("O'chiriladigan qism raqamini yuboring:")
+    await message.answer("🗑 O'chiriladigan qism raqamini yuboring:")
 
 
 @dp.message(Form.delete_episode_number)
@@ -2295,7 +3144,7 @@ async def delete_episode_save(message: Message, state: FSMContext):
 async def del_season_start(call: CallbackQuery, state: FSMContext):
     if not has_permission(call.from_user.id, "delete_content"):
         return await call.answer("⛔ Sizda o‘chirish huquqi yo‘q.", show_alert=True)
-    await ask(call, state, Form.delete_season_code, "Faslini o‘chirmoqchi bo‘lgan kino/serial kodini yuboring:")
+    await ask(call, state, Form.delete_season_code, "🗑 Faslini o‘chirmoqchi bo‘lgan kino/serial kodini yuboring:")
 
 @dp.message(Form.delete_season_code)
 async def del_season_code(message: Message, state: FSMContext):
@@ -2306,18 +3155,18 @@ async def del_season_code(message: Message, state: FSMContext):
         return await message.answer("Kod topilmadi. Qayta yuboring:")
     await state.update_data(delete_season_code=code)
     await state.set_state(Form.delete_season_number)
-    await message.answer("O‘chiriladigan fasl raqamini yuboring:")
+    await message.answer("🗑 O‘chiriladigan fasl raqamini yuboring:")
 
 @dp.message(Form.delete_season_number)
 async def del_season_number(message: Message, state: FSMContext):
     if not has_permission(message.from_user.id, "delete_content"):
         await state.clear(); return
     raw = (message.text or "").strip()
-    if not raw.isdigit(): return await message.answer("Fasl raqamini raqam bilan yuboring:")
+    if not raw.isdigit(): return await message.answer("🔢 Fasl raqamini raqam bilan yuboring:")
     saved = await state.get_data(); code = str(saved.get("delete_season_code", "")); sn = str(int(raw))
     data = load_data(); media = data.get("medias", {}).get(code)
     if not media or sn not in media.get("seasons", {}):
-        return await message.answer("Bunday fasl topilmadi. Qayta yuboring:")
+        return await message.answer("❌ Bunday fasl topilmadi. Qayta yuboring:")
     count = len(media["seasons"][sn].get("episodes", {}))
     del media["seasons"][sn]
     if sn == "1": media["episodes"] = {}
@@ -2326,7 +3175,7 @@ async def del_season_number(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "rename_media")
 async def rename_start(call: CallbackQuery, state: FSMContext):
-    await ask(call, state, Form.rename_code, "Nomi o'zgaradigan media kodini yuboring:")
+    await ask(call, state, Form.rename_code, "✏️ Nomi o'zgaradigan media kodini yuboring:")
 
 
 @dp.message(Form.rename_code)
@@ -2339,7 +3188,7 @@ async def rename_code(message: Message, state: FSMContext):
         return await message.answer("❌ Kod topilmadi:")
     await state.update_data(rename_code=code)
     await state.set_state(Form.rename_name)
-    await message.answer("Yangi media nomini yuboring:")
+    await message.answer("✏️ Yangi media nomini yuboring:")
 
 
 @dp.message(Form.rename_name)
@@ -2357,7 +3206,7 @@ async def rename_name(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "recode_media")
 async def recode_start(call: CallbackQuery, state: FSMContext):
-    await ask(call, state, Form.recode_old, "Eski media kodini yuboring:")
+    await ask(call, state, Form.recode_old, "🔢 Eski media kodini yuboring:")
 
 
 @dp.message(Form.recode_old)
@@ -2370,7 +3219,7 @@ async def recode_old(message: Message, state: FSMContext):
         return await message.answer("❌ Eski kod topilmadi:")
     await state.update_data(recode_old=old)
     await state.set_state(Form.recode_new)
-    await message.answer("Yangi, band bo'lmagan kodni yuboring:")
+    await message.answer("🔢 Yangi, band bo'lmagan kodni yuboring:")
 
 
 @dp.message(Form.recode_new)
@@ -2392,8 +3241,8 @@ async def recode_new(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "add_admin")
 async def add_admin_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
-    await ask(call, state, Form.admin_id_add, "Admin qilinadigan foydalanuvchining Telegram ID raqamini yuboring:")
+        return await call.answer("⛔ Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
+    await ask(call, state, Form.admin_id_add, "👤 Admin qilinadigan foydalanuvchining Telegram ID raqamini yuboring:")
 
 
 @dp.message(Form.admin_id_add)
@@ -2404,7 +3253,7 @@ async def add_admin_save(message: Message, state: FSMContext):
     try:
         user_id = int((message.text or "").strip())
     except ValueError:
-        return await message.answer("Faqat raqam yuboring:")
+        return await message.answer("🔢 Faqat raqam yuboring:")
     data = load_data()
     if user_id not in data["admins"]:
         data["admins"].append(user_id)
@@ -2417,8 +3266,8 @@ async def add_admin_save(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "del_admin")
 async def del_admin_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
-    await ask(call, state, Form.admin_id_del, "Adminlikdan olinadigan Telegram ID raqamini yuboring:")
+        return await call.answer("⛔ Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
+    await ask(call, state, Form.admin_id_del, "👤 Adminlikdan olinadigan Telegram ID raqamini yuboring:")
 
 
 @dp.message(Form.admin_id_del)
@@ -2429,7 +3278,7 @@ async def del_admin_save(message: Message, state: FSMContext):
     try:
         user_id = int((message.text or "").strip())
     except ValueError:
-        return await message.answer("Faqat raqam yuboring:")
+        return await message.answer("🔢 Faqat raqam yuboring:")
     data = load_data()
     if user_id == OWNER_ID:
         return await message.answer("❌ Asosiy adminni o'chirib bo'lmaydi.")
@@ -2443,7 +3292,7 @@ async def del_admin_save(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "add_channel")
 async def add_channel_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
+        return await call.answer("⛔ Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
     await ask(call, state, Form.channel_add,
         "Kanalni yuboring. Ochiq kanal: @username\n"
         "Maxfiy kanal: -100...ID | https://t.me/+taklif_havolasi\n"
@@ -2479,8 +3328,8 @@ async def add_channel_save(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "del_channel")
 async def del_channel_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
-    await ask(call, state, Form.channel_del, "O'chiriladigan kanal @username yoki ID'sini yuboring:")
+        return await call.answer("⛔ Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
+    await ask(call, state, Form.channel_del, "📢 O'chiriladigan kanal @username yoki ID'sini yuboring:")
 
 
 @dp.message(Form.channel_del)
@@ -2511,8 +3360,8 @@ async def del_channel_save(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "start_text")
 async def start_text_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
-    await ask(call, state, Form.start_text, "Yangi /start xabarini yuboring. HTML teglardan foydalanishingiz mumkin:")
+        return await call.answer("⛔ Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
+    await ask(call, state, Form.start_text, "✏️ Yangi /start xabarini yuboring. HTML teglardan foydalanishingiz mumkin:")
 
 
 @dp.message(Form.start_text)
@@ -2529,21 +3378,15 @@ async def start_text_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "referral")
 async def referral_callback(call: CallbackQuery):
+    if not await enforce_subscription(call.from_user.id):
+        return await call.answer("🔒 Avval majburiy kanallarga obuna bo‘ling yoki 💎 VIP oling.", show_alert=True)
+    text, link = await referral_text_and_link(call.from_user.id)
+    kb = referral_keyboard(link)
     try:
-        me = await call.bot.get_me()
-        link = f"https://t.me/{me.username}?start={call.from_user.id}"
-        data = load_data()
-        referrals = sum(1 for u in data.get("users", {}).values() if str(u.get("referrer", "")) == str(call.from_user.id))
-        reward = data.get("settings", {}).get("referral_reward", 5000)
-        text = (f"👥 <b>Referal</b>\n\nDo‘stlaringizga havolani yuboring:\n<code>{link}</code>\n\n"
-                f"👤 Taklif qilganlar: {referrals}\n💰 Har bir referal uchun: {reward} so‘m")
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
-        try:
-            await call.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await call.message.answer(text, reply_markup=kb)
-    finally:
-        await call.answer()
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
 
 
 @dp.callback_query(F.data == "account")
@@ -2551,11 +3394,14 @@ async def account_callback(call: CallbackQuery):
     data = load_data()
     user = data.setdefault("users", {}).get(str(call.from_user.id), {})
     balance = int(user.get("balance", 0) or 0)
-    vip_until = int(user.get("vip_until", 0) or 0)
-    vip_status = "✅ Ha" if vip_until > now_ts() else "❌ Yo‘q"
-    vip_date = fmt_date(vip_until) if vip_until > now_ts() else "—"
+    vip_until = vip_until_ts(user)
+    vip_active = vip_until > now_ts()
+    vip_status = "✅ Ha" if vip_active else "❌ Yo‘q"
+    vip_date = fmt_date(vip_until) if vip_active else "—"
+    storage = ("🔓 Saqlash/uzatish: erkin" if not should_protect_content(call.from_user.id, data)
+               else "🔒 Saqlash/uzatish: VIP bilan ochiladi")
     text = (f"👤 <b>Hisobim</b>\n\n🆔 ID: <code>{call.from_user.id}</code>\n"
-            f"💰 Balans: <b>{balance:,} so‘m</b>\n👑 VIP obunachi: <b>{vip_status}</b>\n📅 VIP muddati: <b>{vip_date}</b>".replace(",", " "))
+            f"💰 Balans: <b>{balance:,} so‘m</b>\n👑 VIP obunachi: <b>{vip_status}</b>\n📅 VIP muddati: <b>{vip_date}</b>\n{storage}".replace(",", " "))
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")], [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
     try: await call.message.edit_text(text, reply_markup=kb)
     except Exception: await call.message.answer(text, reply_markup=kb)
@@ -2574,7 +3420,7 @@ async def owner_notify_toggle(call: CallbackQuery):
 @dp.callback_query(F.data == "stats")
 async def stats(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        return await call.answer("Faqat adminlar uchun", show_alert=True)
+        return await call.answer("⛔ Faqat adminlar uchun", show_alert=True)
     data = load_data()
     users = list(data.get("users", {}).values())
     now = now_ts()
@@ -2590,11 +3436,18 @@ async def stats(call: CallbackQuery):
     cartoon_count = sum(1 for m in medias if m.get("media_type") == "cartoon")
     series_count = sum(1 for m in medias if m.get("media_type") in {"series", "drama"})
     downloads = data.get("downloads", {})
+    vip_ever = sum(1 for u in users if vip_until_ts(u) > 0)
+    vip_active = sum(1 for u in users if vip_until_ts(u) > now)
+    referral_total = sum(1 for u in users if u.get("referral_qualified"))
+    referral_pending = sum(1 for u in users if u.get("referrer") and not u.get("referral_qualified"))
+    referral_rewards = sum(int(u.get("referral_rewards", 0) or 0) for u in users)
     def downloads_in(days):
         return sum(1 for t in downloads.values() if isinstance(t, (int, float)) and t >= now - days * 86400) if isinstance(downloads, dict) else 0
     await call.message.answer(
         f"📊 <b>Statistika</b>\n• Obunachilar soni: {len(users)} ta\n• Faol obunachilar: {active30} ta\n• Tark etganlar: {inactive} ta\n\n"
         f"📈 <b>Obunachilar qo‘shilishi</b>\n• Oxirgi 24 soat: +{joined_in(1)} obunachi\n• Oxirgi 7 kun: +{joined_in(7)} obunachi\n• Oxirgi 30 kun: +{joined_in(30)} obunachi\n\n"
+        f"💎 <b>VIP statistikasi</b>\n• VIP olganlar (qayd etilgan): {vip_ever} ta\n• Hozir VIP faol: {vip_active} ta\n\n"
+        f"👥 <b>Referal statistikasi</b>\n• Hisoblangan referallar: {referral_total} ta\n• Obunani kutayotganlar: {referral_pending} ta\n• Berilgan VIP mukofotlar: {referral_rewards} ta\n\n"
         f"📊 <b>Faollik</b>\n• Oxirgi 24 soatda faol: {seen_in(1)} ta\n• Oxirgi 7 kun faol: {seen_in(7)} ta\n• Oxirgi 30 kun faol: {active30} ta\n\n"
         f"📥 <b>Yuklanishlar</b>\n• Oxirgi 24 soat: {downloads_in(1)} ta\n• Oxirgi 7 kun: {downloads_in(7)} ta\n• Oxirgi 30 kun: {downloads_in(30)} ta\n\n"
         f"🎬 Kinolar soni: {movie_count} ta\n🍥 Anime: {anime_count} ta\n🎨 Multfilm: {cartoon_count} ta\n📺 Serial/drama: {series_count} ta"
@@ -2605,12 +3458,13 @@ async def stats(call: CallbackQuery):
 @dp.callback_query(F.data == "appearance")
 async def appearance_menu(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat admin va owner uchun", show_alert=True)
     data = load_data()
     colors = data.get("settings", {}).get("button_colors", {})
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text=f"🔎 Qidirish tugmalari: {colors.get('search', 'standart')}", callback_data="color_group:search")],
         [InlineKeyboardButton(text=f"🎬 Kontent tugmalari: {colors.get('content', 'standart')}", callback_data="color_group:content")],
+        [InlineKeyboardButton(text=f"⏭ Keyingi qism tugmasi: {colors.get('next_episode', 'standart')}", callback_data="color_group:next_episode")],
         [InlineKeyboardButton(text=f"⬅️ Katalog chap strelkasi: {colors.get('page_left', 'standart')}", callback_data="color_group:page_left")],
         [InlineKeyboardButton(text=f"➡️ Katalog o‘ng strelkasi: {colors.get('page_right', 'standart')}", callback_data="color_group:page_right")],
         [InlineKeyboardButton(text=f"🔢 1/3 sahifa ko‘rsatkichi: {colors.get('page_indicator', 'standart')}", callback_data="color_group:page_indicator")],
@@ -2619,8 +3473,11 @@ async def appearance_menu(call: CallbackQuery):
         [InlineKeyboardButton(text="🌈 Barcha tugmalar", callback_data="color_group:all")],
         [InlineKeyboardButton(text="♻️ Ranglarni tozalash", callback_data="color_reset")],
         [InlineKeyboardButton(text="✏️ Tugma nomlarini o‘zgartirish", callback_data="button_text_menu")],
-        [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
-    ])
+    ]
+    if is_owner(call.from_user.id):
+        rows.append([InlineKeyboardButton(text="😀 Tugmalarga emoji qo‘shish", callback_data="button_emoji_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await call.message.answer("🎨 <b>Chiroyli ko‘rinish</b>\nTugma guruhini tanlang, keyin rangini belgilang. Telegram inline tugmalarda faqat standart, ko‘k (primary), yashil (success) va qizil (danger) uslublarni beradi; boshqa rangni kod bilan majburlab bo‘lmaydi.", reply_markup=kb)
     await call.answer()
 
@@ -2628,10 +3485,10 @@ async def appearance_menu(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("color_group:"))
 async def color_group_select(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat admin va owner uchun", show_alert=True)
     group = call.data.split(":", 1)[1]
-    if group not in {"search", "content", "back", "other", "all", "page_left", "page_right", "page_indicator"}:
-        return await call.answer("Noto‘g‘ri guruh", show_alert=True)
+    if group not in {"search", "content", "next_episode", "back", "other", "all", "page_left", "page_right", "page_indicator"}:
+        return await call.answer("⚠️ Noto‘g‘ri guruh", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🟥 Qizil", callback_data=f"color_set:{group}:danger")],
         [InlineKeyboardButton(text="🟩 Yashil", callback_data=f"color_set:{group}:success")],
@@ -2639,17 +3496,17 @@ async def color_group_select(call: CallbackQuery):
         [InlineKeyboardButton(text="⚪ Standart rang", callback_data=f"color_set:{group}:default")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="appearance")]
     ])
-    await call.message.answer("Rangni tanlang:", reply_markup=kb)
+    await call.message.answer("🎨 Rangni tanlang:", reply_markup=kb)
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("color_set:"))
 async def color_set_save(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat admin va owner uchun", show_alert=True)
     _, group, color = call.data.split(":", 2)
-    if group not in {"search", "content", "back", "other", "all", "page_left", "page_right", "page_indicator"} or color not in {"danger", "success", "primary", "default"}:
-        return await call.answer("Noto‘g‘ri rang", show_alert=True)
+    if group not in {"search", "content", "next_episode", "back", "other", "all", "page_left", "page_right", "page_indicator"} or color not in {"danger", "success", "primary", "default"}:
+        return await call.answer("⚠️ Noto‘g‘ri rang", show_alert=True)
     data = load_data()
     colors = data.setdefault("settings", {}).setdefault("button_colors", {})
     # "default" ham alohida qiymat sifatida saqlanadi: shu orqali "all" rangi
@@ -2657,7 +3514,7 @@ async def color_set_save(call: CallbackQuery):
     colors[group] = color
     save_data(data)
     await appearance_menu(call)
-    await call.answer("Rang saqlandi")
+    await call.answer("✅ Rang saqlandi")
 
 
 # Sahifalash joylashuvini o‘zgartirish funksiyasi olib tashlandi; standart ⬅️ 1/3 ➡️ saqlanadi.
@@ -2665,16 +3522,18 @@ async def color_set_save(call: CallbackQuery):
 @dp.callback_query(F.data == "color_reset")
 async def color_reset(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat admin va owner uchun", show_alert=True)
     data = load_data()
     data.setdefault("settings", {}).pop("button_colors", None)
     save_data(data)
     await appearance_menu(call)
-    await call.answer("Ranglar tozalandi")
+    await call.answer("✅ Ranglar tozalandi")
 
 
 # Tugma matnlarini owner panelidan almashtirish mumkin. Kalitlar callback_data bilan bog'langan.
 EDITABLE_BUTTONS = {
+    "sm:anime": "🍥 Anime qidirish",
+    "sm:kino": "🎞 Kino qidirish",
     "search_menu": "🔎 Kino va serial izlash",
     "guide": "📖 Qo‘llanma",
     "search": "🔢 Kod bo‘yicha qidirish",
@@ -2694,10 +3553,250 @@ EDITABLE_BUTTONS = {
     "broadcast": "📣 Hammaga xabar yuborish",
 }
 
+# Owner panelidagi "Tugmalarga emoji" bo'limi shu ro'yxatlar asosida ishlaydi.
+# Kalit — tugmaning callback_data si, shu orqali emoji aniq tugmaga bog'lanadi.
+BUTTON_EMOJI_GROUPS = [
+    ("main", "🏠 Asosiy menyu", [
+        ("search_menu", "🔎 Anime va Kino izlash"),
+        ("account", "👤 Hisobim"),
+        ("referral", "👥 Referal"),
+        ("vip_buy", "💎 VIP olish"),
+        ("vip_info", "❓ VIP o'zi nima?"),
+        ("order_new", "🛒 Buyurtma berish"),
+        ("complaint_new", "📝 Shikoyat"),
+        ("guide", "📖 Qo'llanma"),
+        ("home", "⬅️ Orqaga / asosiy menyu"),
+    ]),
+    ("search", "🔎 Qidiruv menyusi", [
+        ("search", "🔢 Kod bo'yicha izlash"),
+        ("search_name", "🔠 Nom bo'yicha izlash"),
+        ("category_list:movie", "🎞 Kinolar ro'yxati"),
+        ("category_list:series", "📺 Seriallar ro'yxati"),
+        ("category_list:anime", "🍥 Anime ro'yxati"),
+        ("category_list:cartoon", "🎨 Multfilmlar ro'yxati"),
+        ("check_sub", "✅ Obunani tekshirish"),
+    ]),
+    ("admin", "🛠 Admin / Owner paneli", [
+        ("add_movie", "➕ Kino qo'shish"),
+        ("add_series", "➕ Serial qo'shish"),
+        ("newtype:anime", "🍥 Anime qo'shish"),
+        ("newtype:cartoon", "🎨 Multfilm qo'shish"),
+        ("add_episode", "➕ Qism / yangi fasl"),
+        ("del_media", "🗑 Kontent o'chirish"),
+        ("del_season", "🗑 Fasl o'chirish"),
+        ("rename_media", "✏️ Nom / kodni tahrirlash"),
+        ("edit_poster", "🖼 Posterni tahrirlash"),
+        ("stats", "📊 Statistika"),
+        ("broadcast", "📣 Hammaga xabar yuborish"),
+        ("appearance", "🎨 Tugma ranglari"),
+        ("owner_settings", "⚙️ Bot sozlamalari"),
+        ("manage_users", "👥 Obunachilarni boshqarish"),
+        ("owner_vip", "💎 VIP yoqish/o'chirish"),
+        ("owner_orders", "🛒 Buyurtmalar"),
+        ("owner_complaints", "📝 Shikoyatlar"),
+        ("owner_backup", "💾 Zaxira olish"),
+    ]),
+]
+BUTTON_EMOJI_LABELS = {key: label for _, _, items in BUTTON_EMOJI_GROUPS for key, label in items}
+
+
+def _button_emoji_mark(value):
+    if not value:
+        return "▫️"
+    return "✅" if str(value).isdigit() else str(value)
+
+
+def _extract_custom_emoji_id(message: Message):
+    """Premium emoji yuborilgan bo'lsa, uning custom_emoji_id sini oladi."""
+    for entity in (message.entities or []):
+        if entity.type == "custom_emoji" and getattr(entity, "custom_emoji_id", None):
+            return str(entity.custom_emoji_id)
+    return ""
+
+
+async def _probe_custom_emoji(emoji_id, chat_id) -> bool:
+    """Premium emoji ID ni sinab ko'radi: botga ruxsat bor-yo'qligini aniqlaydi."""
+    try:
+        probe = TelegramInlineKeyboardButton(text="✅ Emoji test", callback_data="emoji_probe", icon_custom_emoji_id=str(emoji_id))
+    except TypeError:
+        _CUSTOM_EMOJI_STATE["allowed"] = False
+        return False
+    try:
+        sent = await bot.send_message(chat_id, "🧪 Premium emoji tekshirilmoqda…", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[probe]]))
+    except TelegramBadRequest as exc:
+        logging.warning("Premium emoji tekshiruvi muvaffaqiyatsiz: %s", exc)
+        if _is_custom_emoji_error(exc):
+            _CUSTOM_EMOJI_STATE["allowed"] = False
+            return False
+        return True
+    except Exception:
+        logging.exception("Premium emoji tekshiruvida xatolik")
+        return True
+    _CUSTOM_EMOJI_STATE["allowed"] = True
+    try:
+        await bot.delete_message(sent.chat.id, sent.message_id)
+    except Exception:
+        pass
+    return True
+
+
+async def verify_custom_emoji_support():
+    """Ishga tushishda saqlangan emojilardan birini sinab ko'radi."""
+    emojis = load_data().get("settings", {}).get("button_emojis", {})
+    emoji_id = next((str(v) for v in emojis.values() if str(v).isdigit()), "")
+    if emoji_id and OWNER_ID:
+        await _probe_custom_emoji(emoji_id, OWNER_ID)
+
+
+@dp.callback_query(F.data == "button_emoji_menu")
+async def button_emoji_menu(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    await state.clear()
+    saved = load_data().get("settings", {}).get("button_emojis", {})
+    rows = []
+    for group_key, group_label, items in BUTTON_EMOJI_GROUPS:
+        count = sum(1 for key, _ in items if saved.get(key))
+        suffix = f" · {count} ta" if count else ""
+        rows.append([InlineKeyboardButton(text=f"{group_label}{suffix}", callback_data=f"button_emoji_group:{group_key}")])
+    rows.append([InlineKeyboardButton(text="♻️ Barcha emojilarni o'chirish", callback_data="button_emoji_reset")])
+    rows.append([InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")])
+    await call.message.answer(
+        "😀 <b>Tugmalarga emoji qo'shish</b>\n"
+        "1️⃣ Guruhni tanlang\n2️⃣ Tugmani tanlang\n3️⃣ Premium emoji ID sini yuboring\n\n"
+        "Premium emoji ID ni maxsus emojini botga yuborish orqali ham olishingiz mumkin — bot ID ni o'zi aniqlaydi. "
+        "Oddiy emoji (masalan 🔥) yuborsangiz, u tugma matni boshiga qo'shiladi.\n\n"
+        "ℹ️ Telegram premium emojini faqat Fragment'da username sotib olgan botlarda yoki "
+        "bot egasida Telegram Premium obunasi bo'lsa ko'rsatadi. Bot buni saqlash paytida avtomatik tekshiradi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("button_emoji_group:"))
+async def button_emoji_group(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    await state.clear()
+    group_key = call.data.split(":", 1)[1]
+    group = next(((label, items) for key, label, items in BUTTON_EMOJI_GROUPS if key == group_key), None)
+    if not group:
+        return await call.answer("⚠️ Guruh topilmadi", show_alert=True)
+    group_label, items = group
+    saved = load_data().get("settings", {}).get("button_emojis", {})
+    rows = []
+    for key, label in items:
+        mark = _button_emoji_mark(saved.get(key))
+        shown = label if len(label) <= 30 else label[:29] + "…"
+        rows.append([InlineKeyboardButton(text=f"{mark} {shown}", callback_data=f"button_emoji_pick:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="button_emoji_menu")])
+    await call.message.answer(f"😀 <b>{group_label}</b>\nEmoji qo'shmoqchi bo'lgan tugmani tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("button_emoji_pick:"))
+async def button_emoji_pick(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    key = call.data.split(":", 1)[1]
+    if key not in BUTTON_EMOJI_LABELS:
+        return await call.answer("⚠️ Tugma topilmadi", show_alert=True)
+    current = load_data().get("settings", {}).get("button_emojis", {}).get(key) or "yo'q"
+    await state.update_data(button_emoji_key=key)
+    await state.set_state(Form.button_emoji_value)
+    rows = []
+    if current != "yo'q":
+        rows.append([InlineKeyboardButton(text="🗑 Emojini o'chirish", callback_data=f"button_emoji_del:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="button_emoji_menu")])
+    await call.message.answer(
+        f"😀 <b>{BUTTON_EMOJI_LABELS[key]}</b>\nHozirgi emoji: <code>{current}</code>\n\n"
+        "Premium emoji ID sini yuboring (masalan <code>5368324170671202286</code>) "
+        "yoki premium emojining o'zini yuboring.\n"
+        "Oddiy emoji yuborsangiz, u tugma matni boshiga qo'shiladi.\n"
+        "Bekor qilish: /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+    await call.answer()
+
+
+@dp.message(Form.button_emoji_value)
+async def button_emoji_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Faqat owner uchun.")
+    raw = (message.text or "").strip()
+    if raw == "/cancel":
+        await state.clear()
+        return await message.answer("✅ Bekor qilindi.", reply_markup=owner_menu())
+    ctx = await state.get_data()
+    key = ctx.get("button_emoji_key")
+    if key not in BUTTON_EMOJI_LABELS:
+        await state.clear()
+        return await message.answer("⚠️ Tugma topilmadi. Qaytadan urinib ko'ring.")
+    custom_id = _extract_custom_emoji_id(message)
+    value = custom_id or raw
+    if not value:
+        return await message.answer("⚠️ Premium emoji ID sini yoki emojining o'zini yuboring. Bekor qilish: /cancel")
+    if custom_id or value.isdigit():
+        if len(value) < 5 or not value.isdigit():
+            return await message.answer("⚠️ Premium emoji ID faqat raqamlardan iborat bo'ladi. Qayta yuboring:")
+        if not await _probe_custom_emoji(value, message.from_user.id):
+            return await message.answer(
+                "❌ Bu premium emoji bilan tugma yuborilmadi.\n"
+                "Sabab: bot Fragment'da username sotib olmagan va bot egasida Telegram Premium yo'q, "
+                "emoji ID noto'g'ri yoki aiogram versiyasi eski (3.31.0 kerak).\n"
+                "Boshqa ID yuboring yoki /cancel bosing.",
+            )
+    elif len(value) > 8 or " " in value:
+        return await message.answer("⚠️ Faqat premium emoji ID (raqam) yoki bitta oddiy emoji yuboring. Qayta yuboring:")
+    data = load_data()
+    data.setdefault("settings", {}).setdefault("button_emojis", {})[key] = value
+    save_data(data)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>{BUTTON_EMOJI_LABELS[key]}</b> tugmasiga emoji saqlandi: <code>{value}</code>\n"
+        "Menyular qayta ochilganda ko'rinadi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="😀 Yana emoji qo'shish", callback_data="button_emoji_menu")],
+            [InlineKeyboardButton(text="👑 Owner paneli", callback_data="admin_home")],
+        ])
+    )
+
+
+@dp.callback_query(F.data.startswith("button_emoji_del:"))
+async def button_emoji_delete(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    key = call.data.split(":", 1)[1]
+    if key not in BUTTON_EMOJI_LABELS:
+        return await call.answer("⚠️ Tugma topilmadi", show_alert=True)
+    data = load_data()
+    data.setdefault("settings", {}).setdefault("button_emojis", {}).pop(key, None)
+    save_data(data)
+    await state.clear()
+    await call.answer("🗑 Emoji o'chirildi")
+    try:
+        await call.message.edit_text(
+            f"🗑 <b>{BUTTON_EMOJI_LABELS[key]}</b> tugmasidagi emoji o'chirildi.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Emoji menyusi", callback_data="button_emoji_menu")]])
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "button_emoji_reset")
+async def button_emoji_reset(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    data = load_data()
+    data.setdefault("settings", {}).pop("button_emojis", None)
+    save_data(data)
+    await button_emoji_menu(call, state)
+
 @dp.callback_query(F.data == "button_text_menu")
 async def button_text_menu(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat admin va owner uchun", show_alert=True)
     data = load_data()
     saved = data.get("settings", {}).get("button_texts", {})
     rows = []
@@ -2716,15 +3815,16 @@ async def button_text_menu(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("button_text_edit:"))
 async def button_text_edit(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
-        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat admin va owner uchun", show_alert=True)
     key = call.data.split(":", 1)[1]
     if key not in EDITABLE_BUTTONS:
-        return await call.answer("Tugma topilmadi", show_alert=True)
+        return await call.answer("❌ Tugma topilmadi", show_alert=True)
     await state.update_data(button_text_key=key)
     await state.set_state(Form.button_text_value)
     await call.message.answer(
         f"Tanlangan tugma: <b>{EDITABLE_BUTTONS[key]}</b>\nYangi nomini yuboring (1–64 belgi). /cancel — bekor qilish.\n\n"
-        "Eslatma: Telegram inline tugma matnida Premium custom emoji ID/entity qo‘llab-quvvatlanmaydi. Oddiy emoji va matn ishlaydi."
+        "Eslatma: premium emoji tugma nomi ichida emas, alohida ikonka sifatida qo'shiladi — "
+        "buning uchun Owner panelidagi «😀 Tugmalarga emoji qo'shish» bo'limidan foydalaning."
     )
     await call.answer()
 
@@ -2735,14 +3835,14 @@ async def button_text_save(message: Message, state: FSMContext):
         return
     new_text = (message.text or "").strip()
     if not new_text:
-        return await message.answer("Matn bo‘sh bo‘lmasin. Yangi nom yuboring yoki /cancel bosing.")
+        return await message.answer("⚠️ Matn bo‘sh bo‘lmasin. Yangi nom yuboring yoki /cancel bosing.")
     if len(new_text) > 64:
-        return await message.answer("Tugma nomi 64 belgidan oshmasin. Qisqaroq nom yuboring.")
+        return await message.answer("⚠️ Tugma nomi 64 belgidan oshmasin. Qisqaroq nom yuboring.")
     state_data = await state.get_data()
     key = state_data.get("button_text_key")
     if key not in EDITABLE_BUTTONS:
         await state.clear()
-        return await message.answer("Tugma topilmadi. Qaytadan urinib ko‘ring.")
+        return await message.answer("⚠️ Tugma topilmadi. Qaytadan urinib ko‘ring.")
     data = load_data()
     texts = data.setdefault("settings", {}).setdefault("button_texts", {})
     if new_text == EDITABLE_BUTTONS[key]:
@@ -2759,18 +3859,18 @@ async def button_text_save(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "button_text_reset")
 async def button_text_reset(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat admin va owner uchun", show_alert=True)
     data = load_data()
     data.setdefault("settings", {}).pop("button_texts", None)
     save_data(data)
     await button_text_menu(call)
-    await call.answer("Tugma nomlari standartga qaytarildi")
+    await call.answer("✅ Tugma nomlari standartga qaytarildi")
 
 
 @dp.callback_query(F.data == "broadcast")
 async def broadcast_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     await state.set_state(Form.broadcast_message)
     await call.message.answer("📣 Barcha foydalanuvchilarga yuboriladigan xabarni matn, rasm yoki video sifatida yuboring. Bekor qilish: /cancel")
     await call.answer()
@@ -2783,7 +3883,7 @@ async def broadcast_send(message: Message, state: FSMContext):
         return await message.answer("Faqat owner uchun.")
     if (message.text or "").strip() == "/cancel":
         await state.clear()
-        return await message.answer("Yuborish bekor qilindi.", reply_markup=owner_menu())
+        return await message.answer("❎ Yuborish bekor qilindi.", reply_markup=owner_menu())
     data = load_data()
     recipients = list(data.get("users", {}).keys())
     sent = failed = 0
@@ -2799,14 +3899,353 @@ async def broadcast_send(message: Message, state: FSMContext):
     await message.answer(f"📣 Xabar yuborish tugadi.\n✅ Yetkazildi: {sent}\n❌ Yetkazilmadi: {failed}", reply_markup=owner_menu())
 
 
+def _chat_status(value) -> str:
+    return str(value).split(".")[-1].lower()
+
+
+def is_mandatory_chat(chat, data=None) -> bool:
+    data = data or load_data()
+    aliases = set()
+    chat_id = getattr(chat, "id", None)
+    if chat_id is not None:
+        aliases |= channel_aliases(str(chat_id))
+    username = getattr(chat, "username", None)
+    if username:
+        aliases |= channel_aliases("@" + str(username))
+    if not aliases:
+        return False
+    for entry in data.get("channels", []):
+        chat_ref, invite_url, _raw = parse_channel_entry(entry)
+        if channel_aliases(chat_ref, invite_url) & aliases:
+            return True
+    return False
+
+
+@dp.chat_member()
+async def member_left_mandatory_channel(event: ChatMemberUpdated):
+    """Kanaldagi «foydalanuvchi chiqib ketdi» amali bo‘yicha faqat o‘shaning kinolarini o‘chiradi."""
+    try:
+        old_status = _chat_status(event.old_chat_member.status)
+        new_status = _chat_status(event.new_chat_member.status)
+        if old_status not in {"creator", "administrator", "member", "restricted"}:
+            return
+        if new_status not in {"left", "kicked"}:
+            return
+        data = load_data()
+        if not is_mandatory_chat(event.chat, data):
+            return
+        uid = int(event.new_chat_member.user.id)
+        if is_vip_user(uid, data):
+            return
+        deleted = await purge_user_media(uid)
+        logging.info("Majburiy kanaldan chiqdi: user=%s chat=%s deleted=%s", uid, getattr(event.chat, "id", ""), deleted)
+    except Exception:
+        logging.exception("chat_member update xatosi")
+
+
+@dp.chat_join_request()
+async def remember_channel_join_request(event):
+    """Maxfiy majburiy kanalga so'rov yuborgan foydalanuvchini qayd etadi.
+
+    So'rov admin tomonidan hali tasdiqlanmagan bo'lsa ham, foydalanuvchi
+    obuna bo'lgan deb hisoblanadi va qayta obunaga majburlanmaydi.
+    """
+    try:
+        data = load_data()
+        chat = event.chat
+        channel_id = str(chat.id)
+        username = getattr(chat, "username", None)
+        invite_obj = getattr(event, "invite_link", None)
+        invite_link = str(getattr(invite_obj, "invite_link", "") or "")
+        event_aliases = channel_aliases(channel_id, invite_link)
+        if username:
+            event_aliases |= channel_aliases("@" + str(username))
+        # Kanal ID, @username yoki taklif havolasi bo'yicha mos kelishini tekshiramiz.
+        matched = any(
+            channel_aliases(*parse_channel_entry(entry)[:2]) & event_aliases
+            for entry in data.get("channels", [])
+        )
+        if not matched:
+            return
+        requests = data.setdefault("join_requests", {})
+        user_key = str(event.from_user.id)
+        user_channels = {str(x) for x in requests.get(user_key, [])}
+        user_channels |= event_aliases
+        requests[user_key] = sorted(user_channels)
+        save_data(data)
+        logging.info("Join request recorded: user=%s channel=%s", user_key, channel_id)
+    except Exception:
+        logging.exception("Join requestni saqlashda xatolik")
+
+
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_callback(call: CallbackQuery):
     data = load_data()
-    if await check_subscription(call.from_user.id):
+    if await enforce_subscription(call.from_user.id):
         await send_start(call.message, call.from_user.id)
         await call.answer("✅ Obuna tasdiqlandi")
     else:
-        await call.answer("Hamma kanallarga obuna bo'ling.", show_alert=True)
+        await call.answer("⚠️ Hamma kanallarga obuna bo'ling yoki 💎 VIP oling.", show_alert=True)
+
+
+# ================= BUYURTMA VA SHIKOYAT =================
+
+REQUEST_META = {
+    "order": {
+        "emoji": "🛒", "noun": "buyurtma", "plural": "Buyurtmalar",
+        "store": "orders", "seq": "order_seq", "reply_title": "Buyurtmangizga javob",
+        "prompt": "🛒 <b>Buyurtma berish</b>\n\nQaysi kino, serial yoki animeni qo'shishimizni xohlaysiz? Nomini va istaklaringizni yozing.\nBekor qilish: /cancel",
+        "received": "✅ Buyurtmangiz qabul qilindi. Tez orada ko'rib chiqamiz.",
+    },
+    "complaint": {
+        "emoji": "📝", "noun": "shikoyat", "plural": "Shikoyatlar",
+        "store": "complaints", "seq": "complaint_seq", "reply_title": "Shikoyatingizga javob",
+        "prompt": "📝 <b>Shikoyat</b>\n\nShikoyatingizni batafsil yozing (muammo, xatolik yoki taklif).\nBekor qilish: /cancel",
+        "received": "✅ Shikoyatingiz qabul qilindi. Ko'rib chiqamiz.",
+    },
+}
+
+
+def _request_recipients(data):
+    ids = {OWNER_ID}
+    ids.update(ADMIN_IDS)
+    ids.update(x for x in data.get("admins", []) if isinstance(x, int))
+    return {i for i in ids if i}
+
+
+async def _request_start(call: CallbackQuery, state: FSMContext, kind: str):
+    await state.clear()
+    await state.update_data(request_kind=kind)
+    await state.set_state(Form.request_text)
+    await call.message.answer(REQUEST_META[kind]["prompt"])
+    await call.answer()
+
+
+@dp.callback_query(F.data == "order_new")
+async def order_new_callback(call: CallbackQuery, state: FSMContext):
+    await _request_start(call, state, "order")
+
+
+@dp.callback_query(F.data == "complaint_new")
+async def complaint_new_callback(call: CallbackQuery, state: FSMContext):
+    await _request_start(call, state, "complaint")
+
+
+@dp.message(Form.request_text)
+async def request_text_save(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=main_menu(message.from_user.id))
+    if not text:
+        return await message.answer("✍️ Iltimos, matn yuboring. Bekor qilish: /cancel")
+    if len(text) < 3:
+        return await message.answer("✍️ Juda qisqa. Batafsilroq yozing:")
+    ctx = await state.get_data()
+    meta = REQUEST_META[ctx.get("request_kind", "order")]
+    text = text[:1500]
+    await state.update_data(request_text=text)
+    await state.set_state(Form.request_confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yuborish", callback_data="req_send"),
+         InlineKeyboardButton(text="❌ Bekor qilish", callback_data="req_cancel")],
+    ])
+    await message.answer(f"{meta['emoji']} <b>Tasdiqlang</b>\n\n{_esc(text)}\n\nYuborishni tasdiqlaysizmi?", reply_markup=kb)
+
+
+@dp.message(Form.request_confirm)
+async def request_confirm_wait(message: Message, state: FSMContext):
+    if (message.text or "").strip() == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=main_menu(message.from_user.id))
+    await message.answer("👆 «✅ Yuborish» yoki «❌ Bekor qilish» tugmasini bosing.")
+
+
+@dp.callback_query(F.data == "req_cancel")
+async def request_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.edit_text("❎ Bekor qilindi.")
+    except Exception:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data == "req_send")
+async def request_send(call: CallbackQuery, state: FSMContext):
+    ctx = await state.get_data()
+    kind = ctx.get("request_kind", "order")
+    text = (ctx.get("request_text") or "").strip()
+    meta = REQUEST_META[kind]
+    if not text:
+        await state.clear()
+        return await call.answer("Matn topilmadi. Qaytadan boshlang.", show_alert=True)
+    data = load_data()
+    data[meta["seq"]] = int(data.get(meta["seq"], 0) or 0) + 1
+    rid = data[meta["seq"]]
+    data.setdefault(meta["store"], []).append({
+        "id": rid, "uid": call.from_user.id, "name": call.from_user.full_name,
+        "username": call.from_user.username or "", "text": text,
+        "at": now_ts(), "status": "new",
+    })
+    save_data(data)
+    await state.clear()
+    try:
+        await call.message.edit_text(f"{meta['received']}\n\n🔖 Raqam: <b>#{rid}</b>")
+    except Exception:
+        await call.message.answer(f"{meta['received']} (#{rid})")
+    await call.answer("✅ Yuborildi")
+    username = f"@{call.from_user.username}" if call.from_user.username else "username yo'q"
+    note = (f"{meta['emoji']} <b>Yangi {meta['noun']}</b> #{rid}\n"
+            f"👤 {_esc(call.from_user.full_name)}\n🔗 {username}\n"
+            f"🆔 <code>{call.from_user.id}</code>\n🕒 {fmt_date(now_ts())}\n\n💬 {_esc(text)}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Javob berish", callback_data=f"reqreply:{kind}:{rid}")],
+    ])
+    for admin_id in _request_recipients(data):
+        try:
+            await bot.send_message(admin_id, note, reply_markup=kb)
+        except Exception as exc:
+            logging.info("Murojaat xabari %s ga yuborilmadi: %s", admin_id, exc)
+
+
+def _requests_back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")],
+    ])
+
+
+async def _show_requests(call: CallbackQuery, kind: str):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    meta = REQUEST_META[kind]
+    data = load_data()
+    items = list(data.get(meta["store"], []))
+    if not items:
+        text = f"{meta['emoji']} <b>{meta['plural']}</b>\n\nHozircha murojaatlar yo'q."
+        try:
+            await call.message.edit_text(text, reply_markup=_requests_back_kb())
+        except Exception:
+            await call.message.answer(text, reply_markup=_requests_back_kb())
+        return await call.answer()
+    new_count = sum(1 for r in items if r.get("status") == "new")
+    blocks, rows = [], []
+    for r in reversed(items[-12:]):
+        status = {"new": "🆕 yangi", "answered": "✍️ javob berilgan", "done": "✅ bajarilgan"}.get(r.get("status"), str(r.get("status")))
+        uname = f"@{r['username']}" if r.get("username") else (r.get("name") or "?")
+        blocks.append(f"#{r['id']} • {status}\n👤 {_esc(str(uname))} • 🆔 <code>{r['uid']}</code>\n💬 {_esc(str(r.get('text', '')))[:220]}")
+        row = [InlineKeyboardButton(text=f"✍️ #{r['id']}", callback_data=f"reqreply:{kind}:{r['id']}")]
+        if r.get("status") != "done":
+            row.append(InlineKeyboardButton(text=f"✅ #{r['id']}", callback_data=f"reqdone:{kind}:{r['id']}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="🗑 Tozalash", callback_data=f"reqclear:{kind}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")])
+    text = f"{meta['emoji']} <b>{meta['plural']}</b> (yangi: {new_count})\n\n" + "\n\n".join(blocks)
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "owner_orders")
+async def owner_orders_callback(call: CallbackQuery):
+    await _show_requests(call, "order")
+
+
+@dp.callback_query(F.data == "owner_complaints")
+async def owner_complaints_callback(call: CallbackQuery):
+    await _show_requests(call, "complaint")
+
+
+@dp.callback_query(F.data.startswith("reqreply:"))
+async def request_reply_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    try:
+        _, kind, rid = call.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        return await call.answer("⚠️ Xato tugma", show_alert=True)
+    if kind not in REQUEST_META:
+        return await call.answer("⚠️ Noma'lum tur", show_alert=True)
+    await state.update_data(reply_kind=kind, reply_id=rid)
+    await state.set_state(Form.request_reply)
+    await call.message.answer(f"✍️ #{rid} {REQUEST_META[kind]['noun']}ga javob matnini yozing.\nBekor qilish: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.request_reply)
+async def request_reply_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Faqat owner uchun.")
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    if not text:
+        return await message.answer("✍️ Javob matnini yuboring. Bekor qilish: /cancel")
+    ctx = await state.get_data()
+    kind = ctx.get("reply_kind")
+    rid = int(ctx.get("reply_id", 0))
+    meta = REQUEST_META.get(kind)
+    data = load_data()
+    record = next((r for r in data.get(meta["store"], []) if r.get("id") == rid), None) if meta else None
+    if not record:
+        await state.clear()
+        return await message.answer("❌ Murojaat topilmadi.", reply_markup=owner_menu())
+    uid = int(record["uid"])
+    reply_text = f"{meta['emoji']} <b>{meta['reply_title']}</b> (#{rid})\n\n{_esc(text[:1500])}"
+    delivered = True
+    try:
+        await bot.send_message(uid, reply_text, reply_markup=main_menu(uid))
+    except Exception:
+        delivered = False
+    record["status"] = "answered"
+    record["reply"] = text[:1500]
+    record["replied_at"] = now_ts()
+    save_data(data)
+    await state.clear()
+    tail = "✅ Javob yuborildi." if delivered else "⚠️ Javob saqlandi, lekin foydalanuvchiga yetkazilmadi (botni bloklagan bo'lishi mumkin)."
+    await message.answer(tail, reply_markup=owner_menu())
+
+
+@dp.callback_query(F.data.startswith("reqdone:"))
+async def request_done(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    try:
+        _, kind, rid = call.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        return await call.answer("⚠️ Xato tugma", show_alert=True)
+    meta = REQUEST_META.get(kind)
+    if not meta:
+        return await call.answer("⚠️ Noma'lum tur", show_alert=True)
+    data = load_data()
+    record = next((r for r in data.get(meta["store"], []) if r.get("id") == rid), None)
+    if record:
+        record["status"] = "done"
+        save_data(data)
+    await call.answer(f"✅ #{rid} bajarildi")
+    await _show_requests(call, kind)
+
+
+@dp.callback_query(F.data.startswith("reqclear:"))
+async def request_clear(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    kind = call.data.split(":")[1]
+    meta = REQUEST_META.get(kind)
+    if not meta:
+        return await call.answer("⚠️ Noma'lum tur", show_alert=True)
+    data = load_data()
+    data[meta["store"]] = [r for r in data.get(meta["store"], []) if r.get("status") == "new"]
+    save_data(data)
+    await call.answer("🗑 Tozalandi")
+    await _show_requests(call, kind)
 
 
 @dp.message(Command("cancel"))
@@ -2818,7 +4257,7 @@ async def cancel_command(message: Message, state: FSMContext):
         if is_admin(message.from_user.id):
             return await message.answer(text, reply_markup=admin_menu(message.from_user.id))
         return await message.answer(text, reply_markup=main_menu(message.from_user.id))
-    await message.answer("Bekor qilinadigan amal yo'q.")
+    await message.answer("ℹ️ Bekor qilinadigan amal yo'q.")
 
 
 @dp.message(F.text.in_({"▶️ Davom ettirish", "⭐ Yoqtirganlarim"}))
@@ -2834,7 +4273,7 @@ async def main_reply_keyboard_routes(message: Message, state: FSMContext):
         if item:
             await send_media_card(message.chat.id, code, item)
         else:
-            await message.answer("Hali tomosha qilgan narsangiz yo‘q.")
+            await message.answer("ℹ️ Hali tomosha qilgan narsangiz yo‘q.")
     elif text == "⭐ Yoqtirganlarim":
         codes = user.get("favorites", [])
         rows = []
@@ -2876,7 +4315,7 @@ async def fallback(message: Message):
         else:
             await message.answer("❌ Bu nom bo'yicha hech narsa topilmadi. Nomning boshqa qismini yozib ko'ring.", reply_markup=main_menu(message.from_user.id))
     elif message.text:
-        await message.answer("Menyudan foydalaning.", reply_markup=main_menu(message.from_user.id))
+        await message.answer("📋 Menyudan foydalaning.", reply_markup=main_menu(message.from_user.id))
 
 
 async def health_check(request: web.Request) -> web.Response:
@@ -2906,14 +4345,18 @@ async def vip_expiry_monitor():
         try:
             data=load_data(); users=data.setdefault("users",{}); changed=False; now=now_ts()
             for uid, user in users.items():
-                until=int(user.get("vip_until",0) or 0)
+                until = vip_until_ts(user)
                 if until <= 0:
                     continue
                 if until <= now:
                     user["vip_until"]=0
                     user.pop("vip_warned_until",None)
                     changed=True
-                    try: await bot.send_message(int(uid), "⏰ VIP obunangiz muddati tugadi. VIP imkoniyatlari avtomatik o'chirildi.")
+                    purged = await purge_vip_media(int(uid), user)
+                    text = "⏰ VIP obunangiz muddati tugadi. VIP imkoniyatlari avtomatik o'chirildi."
+                    if purged:
+                        text += f"\n\n🗑 VIP orqali ochilgan {purged} ta kino chatdan o'chirildi."
+                    try: await bot.send_message(int(uid), text)
                     except Exception: pass
                 elif until-now <= 86400 and int(user.get("vip_warned_until",0) or 0) != until:
                     try:
@@ -2944,16 +4387,19 @@ async def main():
         if admin_id and admin_id not in data.setdefault("admins", []):
             data["admins"].append(admin_id)
     save_data(data)
+    # Saqlangan premium emoji tugmalari ishlashini ishga tushishda bir marta tekshiramiz.
+    await verify_custom_emoji_support()
     runner = await start_web_server()
     vip_monitor_task = asyncio.create_task(vip_expiry_monitor())
     try:
         from aiogram.types import BotCommandScopeChat
-        await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash")])
-        owner_commands = [BotCommand(command="start", description="Botni boshlash"), BotCommand(command="owner", description="Owner paneli"), BotCommand(command="admin", description="Admin paneli"), BotCommand(command="backup", description="Zaxira olish")]
+        user_commands = [BotCommand(command="start", description="Botni boshlash"), BotCommand(command="ref", description="Referal havola va qoidalar")]
+        await bot.set_my_commands(user_commands)
+        owner_commands = user_commands + [BotCommand(command="owner", description="Owner paneli"), BotCommand(command="admin", description="Admin paneli"), BotCommand(command="backup", description="Zaxira olish")]
         await bot.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
         for admin_id in set(ADMIN_IDS + [int(x) for x in data.get("admins", []) if str(x).isdigit()]):
             if admin_id and admin_id != OWNER_ID:
-                await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash"), BotCommand(command="admin", description="Admin paneli")], scope=BotCommandScopeChat(chat_id=admin_id))
+                await bot.set_my_commands(user_commands + [BotCommand(command="admin", description="Admin paneli")], scope=BotCommandScopeChat(chat_id=admin_id))
         await dp.start_polling(bot)
     finally:
         vip_monitor_task.cancel()
