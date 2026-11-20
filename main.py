@@ -51,9 +51,18 @@ def _button_emoji_value(callback_data):
         return ""
 
 
+def _strip_leading_emoji(text):
+    """Tugma matni boshidagi eski emoji/simvollarni olib tashlaydi."""
+    original = str(text or "")
+    cleaned = re.sub(r"^[\W_]+", "", original, count=1)
+    return cleaned or original
+
+
 def _apply_button_emoji(button, value):
     if not value or not _CUSTOM_EMOJI_STATE["allowed"]:
         return button
+    # Yangi emoji eski emoji o'rniga qo'yiladi — ikkitasi qolib ketmaydi.
+    button.text = _strip_leading_emoji(button.text)
     if value.isdigit():
         # icon_custom_emoji_id premium emojini tugma oldiga qo'yadi.
         try:
@@ -449,6 +458,7 @@ def main_menu(user_id=None):
         [InlineKeyboardButton(text="💰 Balans to‘ldirish", callback_data="topup"), InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="❓ VIP o‘zi nima?", callback_data="vip_info")],
         [InlineKeyboardButton(text="🛒 Buyurtma berish", callback_data="order_new"), InlineKeyboardButton(text="📝 Shikoyat", callback_data="complaint_new")],
+        [InlineKeyboardButton(text="📞 Admin bilan bog'lanish", callback_data="contact_admin")],
         [InlineKeyboardButton(text="📖 Qo‘llanma", callback_data="guide")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -559,6 +569,7 @@ def owner_menu():
         [InlineKeyboardButton(text="📣 Hammaga xabar yuborish", callback_data="broadcast")],
         [InlineKeyboardButton(text="🧾 To'lovlar", callback_data="payments"), InlineKeyboardButton(text="💳 To'lov kartasi", callback_data="payment_card_cfg")],
         [InlineKeyboardButton(text="🛒 Buyurtmalar", callback_data="owner_orders"), InlineKeyboardButton(text="📝 Shikoyatlar", callback_data="owner_complaints")],
+        [InlineKeyboardButton(text="📞 Admin lichkasini o'zgartirish", callback_data="edit_admin_contact")],
         [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
         [InlineKeyboardButton(text="👥 Obunachilarni boshqarish", callback_data="manage_users")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
@@ -1180,7 +1191,7 @@ async def owner_settings_callback(call: CallbackQuery):
         [InlineKeyboardButton(text=f"📅 VIP maksimal muddati: {cfg.get('vip_max_months', 6)} oy", callback_data="setcfg:vip_max_months")],
         [InlineKeyboardButton(text=f"⏳ VIP oy davomiyligi: {cfg.get('vip_duration_days', 30)} kun", callback_data="setcfg:vip_duration_days")],
         [InlineKeyboardButton(text=f"🎬 Erta ko‘rish: {cfg.get('early_view_days', 1)} kun", callback_data="setcfg:early_view_days")],
-        [InlineKeyboardButton(text=f"💬 To‘lov admini: @{str(cfg.get('admin_contact', 'obidov_xz')).lstrip('@')}", callback_data="setcfg:admin_contact")],
+        [InlineKeyboardButton(text=f"📞 Admin lichkasi: @{str(cfg.get('admin_contact', 'obidov_xz')).lstrip('@')}", callback_data="setcfg:admin_contact")],
         [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
     try:
@@ -1196,7 +1207,7 @@ async def owner_setting_start(call: CallbackQuery, state: FSMContext):
         return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     key = call.data.split(":", 1)[1]
     prompts = {
-        "admin_contact": "To‘lov adminining username sini yuboring, masalan @obidov_xz:",
+        "admin_contact": "Admin bilan bog'lanish uchun username yuboring, masalan @AnimBot_Admin:",
         "vip_month_price": "VIP obunasining 1 oylik narxini so‘mda yuboring:",
         "referral_need": "Nechta do‘st taklif qilinganda mukofot berilsin (masalan, 3):",
         "referral_vip_days": "Referal mukofoti necha kunlik VIP bo‘lsin (masalan, 3):",
@@ -1249,7 +1260,7 @@ async def owner_setting_save(message: Message, state: FSMContext):
     data.setdefault("settings", {})[key] = value
     save_data(data)
     await state.clear()
-    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_need": "Referal uchun kerakli do‘stlar soni", "referral_vip_days": "Referal mukofoti (kun)", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
+    labels = {"admin_contact": "Admin lichkasi", "vip_month_price": "VIP oylik narxi", "referral_need": "Referal uchun kerakli do‘stlar soni", "referral_vip_days": "Referal mukofoti (kun)", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
     await message.answer(f"✅ {labels.get(key, key)} yangilandi: <b>{value}</b>\nO‘zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
 
 
@@ -3562,6 +3573,8 @@ EDITABLE_BUTTONS = {
     "recode_media": "🔢 Kodini o‘zgartirish",
     "del_media": "🗑 Kino/serial o‘chirish",
     "topup": "💰 Balans to‘ldirish",
+    "contact_admin": "📞 Admin bilan bog'lanish",
+    "edit_admin_contact": "📞 Admin lichkasini o'zgartirish",
     "payments": "🧾 To'lovlar",
     "payment_card_cfg": "💳 To'lov kartasi",
     "stats": "📊 Statistika",
@@ -3581,6 +3594,7 @@ BUTTON_EMOJI_GROUPS = [
         ("vip_info", "❓ VIP o'zi nima?"),
         ("order_new", "🛒 Buyurtma berish"),
         ("complaint_new", "📝 Shikoyat"),
+        ("contact_admin", "📞 Admin bilan bog'lanish"),
         ("guide", "📖 Qo'llanma"),
         ("home", "⬅️ Orqaga / asosiy menyu"),
     ]),
@@ -3609,6 +3623,8 @@ BUTTON_EMOJI_GROUPS = [
         ("owner_settings", "⚙️ Bot sozlamalari"),
         ("manage_users", "👥 Obunachilarni boshqarish"),
         ("owner_vip", "💎 VIP yoqish/o'chirish"),
+        ("contact_admin", "📞 Admin bilan bog'lanish"),
+        ("edit_admin_contact", "📞 Admin lichkasini o'zgartirish"),
         ("payments", "🧾 To'lovlar"),
         ("payment_card_cfg", "💳 To'lov kartasi"),
         ("owner_orders", "🛒 Buyurtmalar"),
@@ -3706,7 +3722,8 @@ async def button_emoji_group(call: CallbackQuery, state: FSMContext):
     rows = []
     for key, label in items:
         mark = _button_emoji_mark(saved.get(key))
-        shown = label if len(label) <= 30 else label[:29] + "…"
+        clean = _strip_leading_emoji(label)
+        shown = clean if len(clean) <= 30 else clean[:29] + "…"
         rows.append([InlineKeyboardButton(text=f"{mark} {shown}", callback_data=f"button_emoji_pick:{key}")])
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="button_emoji_menu")])
     await call.message.answer(f"😀 <b>{group_label}</b>\nEmoji qo'shmoqchi bo'lgan tugmani tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -3728,10 +3745,10 @@ async def button_emoji_pick(call: CallbackQuery, state: FSMContext):
         rows.append([InlineKeyboardButton(text="🗑 Emojini o'chirish", callback_data=f"button_emoji_del:{key}")])
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="button_emoji_menu")])
     await call.message.answer(
-        f"😀 <b>{BUTTON_EMOJI_LABELS[key]}</b>\nHozirgi emoji: <code>{current}</code>\n\n"
+        f"😀 <b>{_strip_leading_emoji(BUTTON_EMOJI_LABELS[key])}</b>\nHozirgi emoji: <code>{current}</code>\n\n"
         "Premium emoji ID sini yuboring (masalan <code>5368324170671202286</code>) "
         "yoki premium emojining o'zini yuboring.\n"
-        "Oddiy emoji yuborsangiz, u tugma matni boshiga qo'shiladi.\n"
+        "Yuborilgan emoji tugmadagi eski emoji o'rniga qo'yiladi.\n"
         "Bekor qilish: /cancel",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
@@ -3773,7 +3790,7 @@ async def button_emoji_save(message: Message, state: FSMContext):
     save_data(data)
     await state.clear()
     await message.answer(
-        f"✅ <b>{BUTTON_EMOJI_LABELS[key]}</b> tugmasiga emoji saqlandi: <code>{value}</code>\n"
+        f"✅ <b>{_strip_leading_emoji(BUTTON_EMOJI_LABELS[key])}</b> tugmasiga emoji saqlandi: <code>{value}</code>\n"
         "Menyular qayta ochilganda ko'rinadi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="😀 Yana emoji qo'shish", callback_data="button_emoji_menu")],
@@ -3796,7 +3813,7 @@ async def button_emoji_delete(call: CallbackQuery, state: FSMContext):
     await call.answer("🗑 Emoji o'chirildi")
     try:
         await call.message.edit_text(
-            f"🗑 <b>{BUTTON_EMOJI_LABELS[key]}</b> tugmasidagi emoji o'chirildi.",
+            f"🗑 <b>{_strip_leading_emoji(BUTTON_EMOJI_LABELS[key])}</b> tugmasidagi emoji o'chirildi.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Emoji menyusi", callback_data="button_emoji_menu")]])
         )
     except Exception:
@@ -4265,6 +4282,49 @@ async def request_clear(call: CallbackQuery):
     save_data(data)
     await call.answer("🗑 Tozalandi")
     await _show_requests(call, kind)
+
+
+def admin_contact_username(data=None):
+    """Admin bilan bog'lanish uchun username (@ siz)."""
+    data = data if data is not None else load_data()
+    raw = str(data.get("settings", {}).get("admin_contact") or ADMIN_CONTACT or "").strip()
+    return raw.lstrip("@").strip()
+
+
+@dp.callback_query(F.data == "contact_admin")
+async def contact_admin(call: CallbackQuery):
+    username = admin_contact_username()
+    if not username:
+        text = "📞 <b>Admin bilan bog'lanish</b>\n\nHozircha aloqa username sozlanmagan."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
+    else:
+        text = ("📞 <b>Admin bilan bog'lanish</b>\n\n"
+                f"💬 Admin: <b>@{_esc(username)}</b>\n\n"
+                "Savol, to'lov yoki muammo bo'lsa, quyidagi tugma orqali yozing.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Adminga yozish", url=f"https://t.me/{username}")],
+            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
+        ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "edit_admin_contact")
+async def edit_admin_contact_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    current = admin_contact_username() or "sozlanmagan"
+    await state.set_state(Form.owner_setting_value)
+    await state.update_data(setting_key="admin_contact")
+    await call.message.answer(
+        f"📞 <b>Admin lichkasi</b>\n\nHozirgi username: <b>@{_esc(current)}</b>\n\n"
+        "Yangi username yuboring (@ bilan), masalan <code>@AnimBot_Admin</code>.\n"
+        "Bu lichka asosiy menyudagi «📞 Admin bilan bog'lanish» tugmasida ko'rinadi.\n"
+        "Bekor qilish: /cancel")
+    await call.answer()
 
 
 # ================= BALANS TO'LDIRISH =================
